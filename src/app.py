@@ -305,7 +305,7 @@ class ARBApp(ARBWrapper, EClient):
 
         f = self.conf_rebalance_misalloc_min_frac
         assert f >= 1.0
-        sufficiently_misallocated = (1 / f) < target_alloc / cur_alloc < 0
+        sufficiently_misallocated = not (1 / f) < target_alloc / cur_alloc < 0
 
         return large_enough_trade and sufficiently_misallocated
 
