@@ -22,6 +22,7 @@ from src.data_model import (
     find_closest_portfolio,
     OrderManager,
     OMState,
+    pp_order,
 )
 from .finsec import SecurityFault, PERMIT_ERROR, Policy, audit_order
 
@@ -40,8 +41,6 @@ class ARBWrapper(EWrapper):
     NEXT_ORDER_REQID = 50000
     OPEN_ORDER_REQID = 60000
     ORDER_STATUS_REQID = 70000
-
-    MAX_PRICING_AGE = 300  # seconds
 
     def __init__(self, log: Logger):
         super().__init__()
@@ -157,7 +156,7 @@ class ARBApp(ARBWrapper, EClient):
         self.conf_mu_at_ath: float = 0.1
         self.conf_dd_coef = 0.7
         self.conf_rebalance_misalloc_min_amt = 750
-        self.conf_rebalance_misalloc_min_frac = 1.1
+        self.conf_rebalance_misalloc_min_frac = 1.03
         self.conf_min_margin_req = 0.25
 
         # control variables
@@ -172,7 +171,7 @@ class ARBApp(ARBWrapper, EClient):
         self.ref_price: Optional[float] = None
 
         self.liveness_delay: float = 2.0
-        self.ev_halt_rebalance = Event()
+        self.workers_halt = Event()
 
         self.order_id_queue = Queue(maxsize=1)
         self.order_manager = OrderManager(log=self.log)
@@ -193,9 +192,7 @@ class ARBApp(ARBWrapper, EClient):
         self.log.info(
             f"Updated account state; "
             f"margin margin_utilization = {self.acct_state.margin_utilization:.3f}; "
-            f"effective margin requirement = {self.acct_state.margin_req:.3f}"
-        )
-        self.log.info(
+            f"effective margin requirement = {self.acct_state.margin_req:.3f}; "
             f"GPV={self.acct_state.gpv/1000:.1f}k; "
             f"EwLV={self.acct_state.ewlv/1000:.1f}k"
         )
@@ -203,14 +200,19 @@ class ARBApp(ARBWrapper, EClient):
     def handle_pos_update(self, pos_data: Dict[Contract, int]) -> None:
 
         self.log.info(
-            f"Received new positions: "
+            f"Received new positions for: "
             f"tickers = {','.join([k.symbol for k in pos_data.keys()])}. "
             f"Total position = {sum(pos_data.values()):.0f}"
         )
 
-        self.portfolio = {
+        updated_positions = {
             NormedContract.normalize_contract(c): v for c, v in pos_data.items()
         }
+
+        if self.portfolio is None:
+            self.portfolio = updated_positions
+        else:
+            self.portfolio.update(updated_positions)
 
         # correct bad primary exchanges in our composition
         for k in self.portfolio.keys():
@@ -240,18 +242,27 @@ class ARBApp(ARBWrapper, EClient):
         self.log.debug(f"Received price for {contract.symbol}: {ohlc}")
         self.portfolio_prices[contract] = ohlc
 
-    def handle_order_open(self, oid, nc, order):
+    def handle_open_order(self, oid, nc, order):
         # will crash if it's not ENTERED <=> snafu!
         assert self.order_manager.transmit_order(nc)
+        self.log.info(f"Order for {pp_order(nc, order)} opened.")
 
     def handle_order_status(self, oid: int, status: OrderState):
+
         nc = self.order_manager.get_nc(oid)
+        order = self.order_manager.get_order(nc)
+
         # if this fails then we have a status before an open order <=> snafu!
         assert nc is not None
-        assert self.order_manager.get_state(nc) == OMState.TRANSMITTED
+        assert order is not None
 
         if status == "Filled":
+            assert self.order_manager.get_state(nc) == OMState.TRANSMITTED
             assert self.order_manager.finalize_order(nc)
+            self.log.info(f"Order for {pp_order(nc, order)} finalized.")
+
+        # TODO needs more granular handling
+        self.log.info(f"Update for order {pp_order(nc, order)}: STATUS = {status}.")
 
     @property
     def pricing_complete(self) -> bool:
@@ -276,13 +287,13 @@ class ARBApp(ARBWrapper, EClient):
         A flag representing whether we have received sufficient information to start
         making trading decisions. True means enough information.
         """
-        return all(
-            (
-                self.acct_state is not None,
-                self.pricing_complete,
-                self.pricing_age < self.MAX_PRICING_AGE,
-                self.ref_price_age < self.MAX_PRICING_AGE,
-            )
+        return (
+            self.acct_state is not None
+            and self.pricing_complete
+            and self.pricing_age < Policy.MAX_PRICING_AGE
+            and self.ref_price_age < Policy.MAX_PRICING_AGE
+            and self.acct_state is not None
+            and self.acct_state.summary_age < Policy.MAX_ACCT_SUM_AGE
         )
 
     def get_target_margin_use(self):
@@ -312,7 +323,7 @@ class ARBApp(ARBWrapper, EClient):
     def rebalance_worker(self):
 
         heartbeats = 0
-        while not self.ev_halt_rebalance.is_set():
+        while not self.workers_halt.is_set():
 
             if not self.is_live:
                 if heartbeats == 4:
@@ -353,19 +364,19 @@ class ARBApp(ARBWrapper, EClient):
                     self.rebalance_target.pop(nc, None)
                     self.clear_any_untransmitted_order(nc)
 
+            self.log.info(
+                f"Target funds: ${funds / 1000:.1f}k "
+                f"(loan = ${(self.acct_state.ewlv - funds) / 1000:.1f}k), "
+                f"using {target_mu * 100:.1f}% of margin."
+            )
+
             if len(self.rebalance_target) > 0:
-                self.log.info(
-                    f"Target funds: ${funds/1000:.1f}k "
-                    f"(loan = ${(self.acct_state.ewlv - funds)/1000:.1f}k), "
-                    f"using {target_mu * 100:.1f}% of margin."
-                )
                 self.log.info(
                     f"Rebalance targets: "
                     f"{ {k.symbol: v for k, v in self.rebalance_target.items()} }."
                 )
                 for nc, order in self.construct_rebalance_orders().items():
                     self.safe_place_order(nc, order)
-
                 self.order_manager.print_book()
             else:
                 self.log.info("Balanced.")
@@ -434,6 +445,16 @@ class ARBApp(ARBWrapper, EClient):
         # TODO this is rather weak, but without a callback...
         time.sleep(0.1)
 
+    def acct_update_worker(self):
+
+        while not self.workers_halt.is_set():
+            self.reqAccountSummary(
+                self.ACCT_SUM_REQID,
+                "All",
+                "EquityWithLoanValue,GrossPositionValue,MaintMarginReq",
+            )
+            time.sleep(60.0)
+
     def execute(self):
 
         try:
@@ -444,11 +465,8 @@ class ARBApp(ARBWrapper, EClient):
             Thread(target=self.run, daemon=True).start()
             self.initialized.wait()
 
-            self.reqAccountSummary(
-                self.ACCT_SUM_REQID,
-                "All",
-                "EquityWithLoanValue,GrossPositionValue,MaintMarginReq",
-            )
+            Thread(target=self.acct_update_worker, daemon=True).start()
+
             self.reqPositions()
             self.reqRealTimeBars(
                 self.REFERENCE_PRICE_REQID, self.ref_contract, 30, "MIDPOINT", False, []
@@ -479,7 +497,7 @@ class ARBApp(ARBWrapper, EClient):
                         break
                 elif req_id == self.OPEN_ORDER_REQID:
                     oid, nc, order, _ = data
-                    self.handle_order_open(oid, nc, order)
+                    self.handle_open_order(oid, nc, order)
                 elif req_id == self.ORDER_STATUS_REQID:
                     oid, status = data
                     self.handle_order_status(oid, status)
@@ -487,7 +505,7 @@ class ARBApp(ARBWrapper, EClient):
                     self.log.fatal(f"Unknown message received {item}. No good.")
                     break
         finally:
-            self.ev_halt_rebalance.set()
+            self.workers_halt.set()
 
             for nc in self.conf_target_composition.keys():
                 self.clear_any_untransmitted_order(nc)

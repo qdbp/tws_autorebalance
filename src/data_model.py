@@ -252,6 +252,12 @@ class AcctState:
         assert r0_safety_factor >= 1.0
         self.r0_safety_factor = r0_safety_factor
 
+        self.created = time.time()
+
+    @property
+    def summary_age(self) -> float:
+        return time.time() - self.created
+
     @property
     def gpv(self):
         """Gross position value."""
@@ -397,7 +403,8 @@ class OrderManager:
     def transmit_order(self, nc: NormedContract) -> bool:
         if self.get_state(nc) != OMState.ENTERED:
             return False
-        self._order_state = OMState.TRANSMITTED
+        self._order_state[nc] = OMState.TRANSMITTED
+        return True
 
     def finalize_order(self, nc: NormedContract) -> bool:
         if self.get_state(nc) != OMState.TRANSMITTED:
@@ -416,6 +423,9 @@ class OrderManager:
     def get_oid(self, nc: NormedContract) -> Optional[int]:
         return self._oid_by_nc.get(nc)
 
+    def get_order(self, nc: NormedContract) -> Optional[int]:
+        return self._orders.get(nc)
+
     def print_book(self):
         for nc, state in self._order_state.items():
             msg = f"Order Book: {nc.symbol} -> {state}"
@@ -424,3 +434,7 @@ class OrderManager:
                 msg += f": {order.action} {order.totalQuantity}"
             # TODO should be debug once things are finalized
             self.log.info(msg)
+
+
+def pp_order(nc: NormedContract, order: Order):
+    return f"{order.action} {order.totalQuantity} {nc.symbol} ({order.orderType})"
