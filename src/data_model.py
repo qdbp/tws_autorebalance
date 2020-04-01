@@ -215,8 +215,6 @@ class AcctState:
     """
     A bookkeeping object responsible for managing the global financial state of the
     account.
-
-    NB. ALL OPTION POSITIONS ARE IGNORED.
     """
 
     def __init__(
