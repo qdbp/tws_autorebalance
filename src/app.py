@@ -98,7 +98,6 @@ class ARBApp(EWrapper, EClient):
 
     @wrapper_override
     def nextValidId(self, order_id: int):
-
         # this is called on the first invocation.
         if not self.initialized.is_set():
             self.initialized.set()
@@ -107,8 +106,7 @@ class ARBApp(EWrapper, EClient):
         try:
             self.order_id_queue.put_nowait(order_id)
         except Full:
-            self.log.fatal("Full order queue -- should not be possible.")
-            raise
+            self.kill_app("Full order queue -- should not be possible.")
 
     @wrapper_override
     def accountSummary(
@@ -267,7 +265,7 @@ class ARBApp(EWrapper, EClient):
         assert cur_alloc >= 1
 
         if target_alloc == 0:
-            raise SecurityFault("Rebalance aims to zero position.")
+            self.kill_app("Rebalance aims to zero position.")
 
         d_dollars = price * abs(cur_alloc - target_alloc)
         large_enough_trade = d_dollars >= self.conf_rebalance_misalloc_min_amt
@@ -426,18 +424,15 @@ class ARBApp(EWrapper, EClient):
                 "WARNING": self.log.warning,
             }[PERMIT_ERROR[error_code]](msg)
         else:
-            self.log.fatal(msg)
-            raise SecurityFault(f"TWS error {error_code}.")
+            self.kill_app(msg)
 
     def kill_app(self, msg: str):
-        self.log.fatal("Killed: {msg}")
+        self.log.fatal(f"Killed: {msg}")
         self.workers_halt.set()
         raise SecurityFault(msg)
 
     def execute(self):
-
         try:
-
             self.log.info("I awaken. Greed is good!")
 
             self.connect("127.0.0.1", 7496, clientId=1337)
@@ -454,7 +449,6 @@ class ARBApp(EWrapper, EClient):
             rebalance_worker = Thread(target=self.rebalance_worker, daemon=True)
             rebalance_worker.start()
             rebalance_worker.join()
-
         finally:
             self.workers_halt.set()
             for nc in self.conf_target_composition.keys():
