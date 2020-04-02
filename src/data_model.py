@@ -18,19 +18,6 @@ import src.finsec as sec
 np.set_printoptions(precision=2)
 
 
-@total_ordering
-class PQM:
-    __slots__ = ("data", "prio", "req_id")
-
-    def __init__(self, data: Any, prio: int = 0, req_id: Optional[int] = None):
-        self.data = data
-        self.prio = prio
-        self.req_id = req_id
-
-    def __lt__(self, other):
-        return self.prio < other.prio
-
-
 @dataclass(frozen=True)
 class OHLCBar:
     __slots__ = ("t", "o", "h", "l", "c")
@@ -39,6 +26,15 @@ class OHLCBar:
     h: float
     l: float
     c: float
+
+
+@dataclass(frozen=True)
+class Trade:
+    __slots__ = ('t', 'nc', 'fill_px', 'fill_qty')
+    t: float
+    nc: NormedContract
+    fill_px: float
+    fill_qty: int
 
 
 def find_closest_portfolio(
@@ -423,15 +419,15 @@ class OrderManager:
     def get_oid(self, nc: NormedContract) -> Optional[int]:
         return self._oid_by_nc.get(nc)
 
-    def get_order(self, nc: NormedContract) -> Optional[int]:
+    def get_order(self, nc: NormedContract) -> Optional[Order]:
         return self._orders.get(nc)
 
     def print_book(self):
         for nc, state in self._order_state.items():
-            msg = f"Order Book: {nc.symbol} -> {state}"
+            msg = f"Order Book: {state}"
             if state == OMState.ENTERED or state == OMState.TRANSMITTED:
                 order = self._orders[nc]
-                msg += f": {order.action} {order.totalQuantity}"
+                msg += f": {pp_order(nc, order)}"
             # TODO should be debug once things are finalized
             self.log.info(msg)
 
