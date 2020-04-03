@@ -20,8 +20,8 @@ from src.data_model import (
     NormedContract,
     find_closest_portfolio,
     OrderManager,
-    OMState,
     pp_order,
+    OMState,
 )
 from .finsec import SecurityFault, PERMIT_ERROR, Policy, audit_order
 
@@ -74,10 +74,10 @@ class ARBApp(EWrapper, EClient):
 
         # TODO move to config
         self.conf_target_composition = target_composition
-        self.conf_ref_price_ath: float = 335.0
+        self.conf_ref_price_ath: float = 160.0
         self.conf_mu_at_ath: float = 0.0
-        self.conf_dd_coef = 1.1
-        self.conf_rebalance_misalloc_min_amt = 750
+        self.conf_dd_coef = 1.5
+        self.conf_rebalance_misalloc_min_amt = 500
         self.conf_rebalance_misalloc_min_frac = 1.03
         self.conf_min_margin_req = 0.25
 
@@ -92,7 +92,8 @@ class ARBApp(EWrapper, EClient):
         self.ref_price_age: float = float("inf")
         self.ref_price: Optional[float] = None
 
-        self.liveness_delay: float = 2.0
+        self.liveness_timeout: float = 10.0
+        self.liveness_event: Event = Event()
 
         self.order_id_queue = Queue(maxsize=1)
         self.order_manager = OrderManager(log=self.log)
@@ -134,8 +135,8 @@ class ARBApp(EWrapper, EClient):
 
         self.log.info(
             f"Got acct. info: "
-            f"margin util. = {self.acct_state.margin_utilization * 100:.1f}%, "
-            f"margin req. = {self.acct_state.margin_req * 100:.1f}%, "
+            f"margin util. = {self.acct_state.margin_utilization * 100:.2f}%, "
+            f"margin req. = {self.acct_state.margin_req * 100:.2f}%, "
             f"GPV={self.acct_state.gpv / 1000:.1f}k, "
             f"EwLV={self.acct_state.ewlv / 1000:.1f}k."
         )
@@ -207,18 +208,28 @@ class ARBApp(EWrapper, EClient):
     def orderStatus(
         self, oid: int, status: str, filled: float, rem: float, av_fill_px: float, *_,
     ):
+        # this assumes that for an order X, orderStatus will never be called again
+        # more than COOLOFF seconds after the finalization call for X.
         nc = self.order_manager.get_nc(oid)
         assert nc is not None
-        assert self.order_manager.get_state(
-            nc
-        ) == OMState.TRANSMITTED or self.order_manager.transmit_order(nc)
 
         order = self.order_manager.get_order(nc)
         assert order is not None
 
+        state = self.order_manager[nc]
+
+        if state == OMState.COOLOFF:
+            self.log.info(f"Dropping post-finalization call for {oid=}")
+            return
+
+        assert state == OMState.TRANSMITTED or self.order_manager.transmit_order(nc)
+
         if status == "Filled":
             assert self.order_manager.finalize_order(nc)
             self.log.info(f"Order for {pp_order(nc, order)} finalized.")
+            self.reqPositions()
+        else:
+            self.log.info(f"Order status for {pp_order(nc, order)}: {status}")
 
     @property
     def pricing_complete(self) -> bool:
@@ -251,10 +262,26 @@ class ARBApp(EWrapper, EClient):
             and self.ref_price_age < Policy.MAX_PRICING_AGE
         )
 
+    def wait_until_live(self):
+        self.liveness_event.wait(self.liveness_timeout) or self.kill_app(
+            "Unable to come alive in time."
+        )
+
+    @property
+    def effective_drawdown(self) -> float:
+        self.wait_until_live()
+        port_price = sum(
+            self.conf_target_composition[nc] * self.portfolio_prices[nc].c
+            for nc in self.conf_target_composition.keys()
+        )
+        out = 1 - port_price / self.conf_ref_price_ath
+        assert 0 <= out < 1
+        return out
+
     def get_target_margin_use(self):
+        self.wait_until_live()
         return min(
-            self.conf_mu_at_ath
-            + self.conf_dd_coef * (1 - self.ref_price / self.conf_ref_price_ath),
+            self.conf_mu_at_ath + self.conf_dd_coef * self.effective_drawdown,
             Policy.MARGIN_USAGE.block_level - 0.01,
         )
 
@@ -339,25 +366,9 @@ class ARBApp(EWrapper, EClient):
 
     def rebalance_worker(self):
 
-        heartbeats = 0
         while not self.workers_halt.is_set():
 
-            if not self.is_live:
-                if heartbeats == 4:
-                    self.kill_app("Unable to come alive in time.")
-                to_sleep = 1 + self.liveness_delay * heartbeats
-                {
-                    0: self.log.info,
-                    1: self.log.warning,
-                    2: self.log.error,
-                    3: self.log.fatal,
-                }[heartbeats](f"Not live yet. Sleeping {to_sleep}.")
-
-                time.sleep(to_sleep)
-                heartbeats += 1
-                continue
-
-            heartbeats = 0
+            self.wait_until_live()
 
             target_mu = self.get_target_margin_use()
             target_loan = self.acct_state.get_loan_at_target_utilization(target_mu)
@@ -370,32 +381,42 @@ class ARBApp(EWrapper, EClient):
                 funds, self.conf_target_composition, close_prices
             )
 
+            ideal_allocation_delta = {}
+
             for nc in self.conf_target_composition.keys():
                 target_alloc = model_alloc[nc]
                 cur_alloc = self.portfolio[nc]
                 price = close_prices[nc]
+
                 if self.check_if_needs_rebalance(price, cur_alloc, target_alloc):
                     self.rebalance_target[nc] = target_alloc - cur_alloc
                 else:
                     self.rebalance_target.pop(nc, None)
                     self.clear_any_untransmitted_order(nc)
 
+                if target_alloc != cur_alloc:
+                    ideal_allocation_delta[nc.symbol] = target_alloc - cur_alloc
+
             self.log.info(
                 f"Target funds: ${funds / 1000:.1f}k "
                 f"(loan = ${(self.acct_state.ewlv - funds) / 1000:.1f}k), "
-                f"which uses {target_mu * 100:.1f}% of margin."
+                f"which uses {target_mu * 100:.2f}% of margin."
             )
 
             if len(self.rebalance_target) > 0:
                 self.log.info(
                     f"Rebalance targets: "
-                    f"{{k.symbol: v for k, v in self.rebalance_target.items()}}."
+                    f"{ {k.symbol: v for k, v in self.rebalance_target.items()} }."
                 )
                 for nc, order in self.construct_rebalance_orders().items():
                     self.safe_place_order(nc, order)
                 self.order_manager.print_book()
             else:
-                self.log.info("Balanced.")
+                ideal_fmt = ", ".join(
+                    f"{sym}{'+' if num > 0 else '-'}{abs(num)}"
+                    for sym, num in ideal_allocation_delta.items()
+                )
+                self.log.info(f"Balanced. Ideal = {ideal_fmt}")
 
             time.sleep(60.0)
 
@@ -409,15 +430,20 @@ class ARBApp(EWrapper, EClient):
             )
             time.sleep(60.0)
 
+    def liveness_worker(self):
+        while not self.workers_halt.is_set():
+            if not self.is_live:
+                self.liveness_event.clear()
+            else:
+                self.liveness_event.set()
+            time.sleep(0.1)
+
     @wrapper_override
     def error(self, req_id: TickerId, error_code: int, error_string: str):
         msg = f"TWS error channel: req({req_id}) ∷ {error_code} - {error_string}"
         # pacing violation
         if error_code == 420:
-            self.log.error(
-                msg := (Fore.GREEN + "🌿 error 420 🌿 you need to chill 🌿" + Fore.RESET)
-            )
-            self.kill_app(msg)
+            self.kill_app(Fore.GREEN + "🌿 error 420 🌿 you need to chill 🌿" + Fore.RESET)
         elif error_code in PERMIT_ERROR:
             {
                 "DEBUG": self.log.debug,
@@ -440,6 +466,7 @@ class ARBApp(EWrapper, EClient):
             Thread(target=self.run, daemon=True).start()
             self.initialized.wait()
 
+            Thread(target=self.liveness_worker, daemon=True).start()
             Thread(target=self.acct_update_worker, daemon=True).start()
 
             self.reqPositions()

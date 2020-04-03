@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum, auto
 from functools import total_ordering
 from logging import Logger
-from typing import Any, Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple
 
 import numpy as np
 import pulp
@@ -384,6 +384,10 @@ class OrderManager:
             self._order_state.get(nc) == OMState.COOLOFF
             and time.time() - self._cooloff_time[nc] > sec.Policy.ORDER_COOLOFF
         ):
+            oid = self._oid_by_nc[nc]
+            del self._nc_by_oid[oid]
+            del self._oid_by_nc[nc]
+            del self._orders[nc]
             del self._order_state[nc]
             del self._cooloff_time[nc]
 
@@ -419,10 +423,6 @@ class OrderManager:
     def finalize_order(self, nc: NormedContract) -> bool:
         if self.get_state(nc) != OMState.TRANSMITTED:
             return False
-        oid = self._oid_by_nc[nc]
-        del self._nc_by_oid[oid]
-        del self._oid_by_nc[nc]
-        del self._orders[nc]
         self._cooloff_time[nc] = time.time()
         self._order_state[nc] = OMState.COOLOFF
         return True
@@ -444,6 +444,9 @@ class OrderManager:
                 msg += f": {pp_order(nc, order)}"
             # TODO should be debug once things are finalized
             self.log.info(msg)
+
+    def __getitem__(self, nc: NormedContract) -> OMState:
+        return self.get_state(nc)
 
 
 def pp_order(nc: NormedContract, order: Order):

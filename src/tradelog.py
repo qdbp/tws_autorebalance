@@ -14,6 +14,7 @@ from typing import (
     Optional,
 )
 
+import matplotlib.pyplot as plt
 from cycler import cycler
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
@@ -106,9 +107,7 @@ def calculate_profit_attributions(trades: List[Trade]) -> List[ProfitAttribution
                     qty_attributed = abs(open_tr.fill_qty)
                     net_gain = qty_attributed * px_diff
                     profit_attr.append(
-                        ProfitAttribution(
-                            sym, net_gain, open_tr.time, close_tr.time
-                        )
+                        ProfitAttribution(sym, net_gain, open_tr.time, close_tr.time)
                     )
                     new_qty = shrink(close_tr.fill_qty, qty_attributed)
                     # unless the two cancel exactly, in which case we get the next trade
@@ -122,9 +121,7 @@ def calculate_profit_attributions(trades: List[Trade]) -> List[ProfitAttribution
                     qty_attributed = abs(close_tr.fill_qty)
                     net_gain = qty_attributed * px_diff
                     profit_attr.append(
-                        ProfitAttribution(
-                            sym, net_gain, open_tr.time, close_tr.time
-                        )
+                        ProfitAttribution(sym, net_gain, open_tr.time, close_tr.time)
                     )
                     new_qty = shrink(open_tr.fill_qty, qty_attributed)
                     new_prev_trade = replace(open_tr, fill_qty=new_qty)
@@ -198,8 +195,6 @@ class AttributionSet:
         self.pas.sort()
 
     def plot(self) -> Figure:
-        import matplotlib.pyplot as plt
-
         fig: Figure = plt.figure()
         ax: Axes = fig.subplots()
 
@@ -216,7 +211,7 @@ class AttributionSet:
 
         for pa in self.pas:
             sym = pa.symbol
-            if sym == 'ZROZ':
+            if sym == "ZROZ":
                 continue
             ax.plot(
                 [pa.start_time, pa.end_time],
@@ -242,7 +237,10 @@ class AttributionSet:
 if __name__ == "__main__":
 
     trade_lists = parse_tws_tradelog(PROJECT_ROOT.joinpath("data/trades_ytd.csv"))
-    profit_attrs = {sym: calculate_profit_attributions(trades) for sym, trades in trade_lists.items()}
+    profit_attrs = {
+        sym: calculate_profit_attributions(trades)
+        for sym, trades in trade_lists.items()
+    }
 
     all_attrs = AttributionSet()
     for sym, atts in profit_attrs.items():
@@ -253,6 +251,4 @@ if __name__ == "__main__":
     print(all_attrs.get_grand_total())
 
     fig = all_attrs.plot()
-    import matplotlib.pyplot as plt
-
     plt.show()
