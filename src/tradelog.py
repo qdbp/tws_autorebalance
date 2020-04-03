@@ -1,28 +1,26 @@
 from __future__ import annotations
+
 from collections import defaultdict
-from datetime import datetime
 from csv import reader
 from dataclasses import dataclass, replace
+from datetime import datetime
 from functools import total_ordering
+from numbers import Real
 from time import strptime
-from cycler import cycler
 from typing import (
     List,
     DefaultDict,
-    FrozenSet,
-    Dict,
-    Union,
-    ClassVar,
     Iterable,
     Optional,
 )
 
+from cycler import cycler
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.ticker import MultipleLocator
 
-from src.data_model import Trade
 from src import PROJECT_ROOT
+from src.data_model import Trade
 
 
 def parse_tws_tradelog(fn: str) -> DefaultDict[str, List[Trade]]:
@@ -51,6 +49,100 @@ def parse_tws_tradelog(fn: str) -> DefaultDict[str, List[Trade]]:
         out[sym].append(Trade(t, sym, qty, price))
 
     return out
+
+
+def sgn(x: Real) -> int:
+    return -1 if x < 0 else 1
+
+
+def shrink(x, d):
+    assert d <= abs(x)
+    assert d >= 0
+    return sgn(x) * (abs(x) - d)
+
+
+def calculate_profit_attributions(trades: List[Trade]) -> List[ProfitAttribution]:
+
+    if len(trades) < 2:
+        return []
+
+    sym = trades[0].sym
+
+    open_positions: List[Trade] = []
+    profit_attr: List[ProfitAttribution] = []
+
+    for close_tr in sorted(trades):
+
+        # this is an invariant that should be maintained by the attribution algorithm.
+        assert all(p.fill_qty < 0 for p in open_positions) or all(
+            p.fill_qty > 0 for p in open_positions
+        ), str([str(op) for op in open_positions])
+        # to check we have a consistent history
+        assert close_tr.sym == sym
+        assert close_tr.fill_qty != 0
+
+        while open_positions:
+
+            open_tr = open_positions.pop()
+            assert open_tr.time < close_tr.time
+
+            # (some of) the query trade closes (some of) the latest position
+            if open_tr.fill_qty * close_tr.fill_qty < 0:
+                # accounting is symmetric with respect to long/short positions.
+                # i.e. a more recent buy is considered closing a short and a more
+                # recent sell is considered closing a long
+                if open_tr.fill_qty > 0:
+                    bot_px = open_tr.fill_px
+                    sld_px = close_tr.fill_px
+                else:
+                    bot_px = close_tr.fill_px
+                    sld_px = open_tr.fill_px
+
+                px_diff = sld_px - bot_px
+
+                # if we closed more than accounted for by the latest open position, we
+                # remove that position from the stack and continue with an abated query
+                if abs(open_tr.fill_qty) <= abs(close_tr.fill_qty):
+                    qty_attributed = abs(open_tr.fill_qty)
+                    net_gain = qty_attributed * px_diff
+                    profit_attr.append(
+                        ProfitAttribution(
+                            sym, net_gain, open_tr.time, close_tr.time
+                        )
+                    )
+                    new_qty = shrink(close_tr.fill_qty, qty_attributed)
+                    # unless the two cancel exactly, in which case we get the next trade
+                    if new_qty == 0:
+                        break
+                    close_tr = replace(close_tr, fill_qty=new_qty)
+                    continue  # traversing the open positions to attribute the rest
+
+                # the latest trade doesn't fully close the latest open position
+                else:
+                    qty_attributed = abs(close_tr.fill_qty)
+                    net_gain = qty_attributed * px_diff
+                    profit_attr.append(
+                        ProfitAttribution(
+                            sym, net_gain, open_tr.time, close_tr.time
+                        )
+                    )
+                    new_qty = shrink(open_tr.fill_qty, qty_attributed)
+                    new_prev_trade = replace(open_tr, fill_qty=new_qty)
+                    open_positions.append(new_prev_trade)
+                    break  # because we've exhausted the current query
+
+            # the query trade opens more of the position
+            else:
+                open_positions.append(open_tr)
+                open_positions.append(close_tr)
+                break  # get new trade
+
+        # the current open positions list is empty -- the remainder of the query is
+        # added as an open position
+        else:
+            open_positions.append(close_tr)
+
+    return profit_attr
 
 
 @total_ordering
@@ -111,18 +203,21 @@ class AttributionSet:
         fig: Figure = plt.figure()
         ax: Axes = fig.subplots()
 
-        col_cyc = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        col_cyc = plt.rcParams["axes.prop_cycle"].by_key()["color"]
         print(col_cyc)
-        # cyc = cycler(color='rgbk') * cycler(linestyle=['-', '--', '-.', ':'])
-        cyc = cycler(color=col_cyc) * cycler(linestyle=['-', ':'])
+        cyc = cycler(color=col_cyc) * cycler(linestyle=["-", ":"])
 
         styles = list(cyc)
-        ixes = {sym: ix for ix, sym in enumerate(sorted({pa.symbol for pa in self.pas}))}
+        ixes = {
+            sym: ix for ix, sym in enumerate(sorted({pa.symbol for pa in self.pas}))
+        }
 
         have_labelled = set()
 
         for pa in self.pas:
             sym = pa.symbol
+            if sym == 'ZROZ':
+                continue
             ax.plot(
                 [pa.start_time, pa.end_time],
                 [pa.net_gain, pa.net_gain],
@@ -136,95 +231,18 @@ class AttributionSet:
         ax.set_title("Day Trades Profit-Span Plot")
         ax.set_ylabel("Profit/Loss (only height matters, not area under curve!)")
         ax.set_xlabel("Open/Close dates of trades.")
-        ax.grid(which='major')
+        ax.grid(which="major")
         ax.yaxis.set_minor_locator(MultipleLocator(100))
         ax.xaxis.set_minor_locator(MultipleLocator(1))
-        ax.grid(which='minor', lw=0.25)
+        ax.grid(which="minor", lw=0.25)
         fig.set_size_inches((12, 8))
         return fig
-
-
-def calc_tv_profits(trades: List[Trade]) -> List[ProfitAttribution]:
-
-    if len(trades) < 2:
-        return []
-
-    sym = trades[0].sym
-
-    open_positions: List[Trade] = []
-    profit_attr: List[ProfitAttribution] = []
-
-    for trade in sorted(trades):
-
-        # this is an invariant that should be maintained by the attribution algorithm.
-        assert all(p.fill_qty < 0 for p in open_positions) or all(
-            p.fill_qty > 0 for p in open_positions
-        ), str([str(op) for op in open_positions])
-        # to check we have a consistent history
-        assert trade.sym == sym
-
-        query_trade = trade
-        while open_positions:
-            latest_open = open_positions.pop()
-            # (some of) the query trade closes (some of) the latest position
-            if latest_open.fill_qty * query_trade.fill_qty < 0:
-                # accounting is symmetric with respect to long/short positions.
-                # i.e. a more recent buy is considered closing a short and a more
-                # recent sell is considered closing a long
-                if latest_open.fill_qty > 0:
-                    bot_px = latest_open.fill_px
-                    sld_px = query_trade.fill_px
-                else:
-                    bot_px = query_trade.fill_px
-                    sld_px = latest_open.fill_px
-
-                px_diff = sld_px - bot_px
-
-                # if we closed more than accounted for by the latest open position, we
-                # remove that position from the stack and continue with an abated query
-                if abs(latest_open.fill_qty) <= abs(query_trade.fill_qty):
-                    qty_attributed = abs(latest_open.fill_qty)
-                    net_gain = qty_attributed * px_diff
-                    profit_attr.append(
-                        ProfitAttribution(
-                            sym, net_gain, latest_open.time, query_trade.time
-                        )
-                    )
-                    query_trade = replace(
-                        query_trade, fill_qty=query_trade.fill_qty - qty_attributed
-                    )
-                    continue  # traversing the open positions to attribute the rest
-                else:
-                    qty_attributed = abs(query_trade.fill_qty)
-                    net_gain = qty_attributed * px_diff
-                    profit_attr.append(
-                        ProfitAttribution(
-                            sym, net_gain, latest_open.time, query_trade.time
-                        )
-                    )
-                    new_prev_trade = replace(
-                        latest_open, fill_qty=latest_open.fill_qty - qty_attributed
-                    )
-                    open_positions.append(new_prev_trade)
-                    break  # because we've exhausted the current query
-
-            # the query trade opens more of the position
-            else:
-                open_positions.append(query_trade)
-                break  # get new trade
-
-        # the current open positions list is empty -- the remainder of the query is
-        # added as an open position
-        else:
-            open_positions.append(query_trade)
-
-    return profit_attr
 
 
 if __name__ == "__main__":
 
     trade_lists = parse_tws_tradelog(PROJECT_ROOT.joinpath("data/trades_ytd.csv"))
-    profit_attrs = {sym: calc_tv_profits(trades) for sym, trades in trade_lists.items()}
+    profit_attrs = {sym: calculate_profit_attributions(trades) for sym, trades in trade_lists.items()}
 
     all_attrs = AttributionSet()
     for sym, atts in profit_attrs.items():

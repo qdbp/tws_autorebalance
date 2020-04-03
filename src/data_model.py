@@ -38,6 +38,9 @@ class Trade:
     fill_qty: int
     fill_px: float
 
+    def __post_init__(self):
+        assert self.fill_px >= 0
+
     def __le__(self, other: Trade):
         return self.time <= other.time
 
