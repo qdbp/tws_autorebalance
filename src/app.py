@@ -332,6 +332,9 @@ class ARBApp(EWrapper, EClient):
         # TODO this is rather weak, but without a callback...
         time.sleep(0.1)
 
+    def notify_desktop(self, msg: str):
+        sbp.run(("notify-send", "-t", str(int(self.rebalance_every * 990)), msg))
+
     def rebalance_worker(self):
 
         while not self.workers_halt.is_set():
@@ -379,12 +382,15 @@ class ARBApp(EWrapper, EClient):
 
             if len(self.rebalance_target) > 0:
                 self.log.info(
-                    f"Rebalance targets: "
-                    f"{ {k.symbol: v for k, v in self.rebalance_target.items()} }."
+                    rebalance_msg := (
+                        f"Rebalance targets: "
+                        f"{ {k.symbol: v for k, v in self.rebalance_target.items()} }."
+                    )
                 )
                 for nc, order in self.construct_rebalance_orders().items():
                     self.safe_place_order(nc, order)
                 self.order_manager.print_book()
+                self.notify_desktop(rebalance_msg)
             else:
                 ideal_fmt = ", ".join(
                     f"{sym}{'+' if num > 0 else '-'}{abs(num)}"
