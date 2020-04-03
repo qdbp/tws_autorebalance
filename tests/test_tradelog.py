@@ -1,11 +1,12 @@
 from datetime import datetime as dt
-from src.tradelog import shrink, calculate_profit_attributions, ProfitAttribution
-from src.data_model import Trade
 
 from pytest import raises
 
+from src.data_model import Trade
+from src.tradelog import shrink, calculate_profit_attributions, ProfitAttribution
 
-def test_close_fun():
+
+def test_shrink():
 
     assert shrink(-5, 1) == -4
     assert shrink(-5, 5) == 0
@@ -19,7 +20,7 @@ def test_close_fun():
         shrink(10, 11)
 
 
-def test_calc_attrs():
+def test_calculate_profit_attributions():
 
     sym = "A"
 
@@ -62,6 +63,6 @@ def test_calc_attrs():
     assert (out := calculate_profit_attributions(trades)) == [
         ProfitAttribution(sym, 5 * 5.0, t1, t2),   # B through A; A <- A'
         ProfitAttribution(sym, 20 * -10, t3, t4),  # D through C; del C
-        ProfitAttribution(sym, 0.0, t1, t4),       # D through A'; del A'; C' to Open
-        ProfitAttribution(sym, 5 * 5.0, t4, t5),  # D through A'; del A'; C' to Open
+        ProfitAttribution(sym, 0.0, t1, t4),       # D through A'; del A'; D' to Open
+        ProfitAttribution(sym, 5 * 5.0, t4, t5),   # E through D'; del D'; nothing open
     ]
