@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 from functools import total_ordering
 from logging import Logger
@@ -28,13 +29,23 @@ class OHLCBar:
     c: float
 
 
+@total_ordering
 @dataclass(frozen=True)
 class Trade:
-    __slots__ = ('t', 'nc', 'fill_px', 'fill_qty')
-    t: float
-    nc: NormedContract
-    fill_px: float
+    __slots__ = ("time", "sym", "fill_qty", "fill_px")
+    time: datetime
+    sym: str
     fill_qty: int
+    fill_px: float
+
+    def __le__(self, other: Trade):
+        return self.time <= other.time
+
+    def __str__(self) -> str:
+        return (
+            f"Trade({self.sym} Δ{self.fill_qty} @ "
+            f"{self.fill_px} @ {datetime(*self.time[:6])}"
+        )
 
 
 def find_closest_portfolio(

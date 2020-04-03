@@ -35,9 +35,10 @@ def wrapper_override(f: Callable):
 
 
 class ARBApp(EWrapper, EClient):
-    ACCT_SUM_REQID = 10000
-    PORTFOLIO_PRICE_REQID = 30000
-    REFERENCE_PRICE_REQID = 40000
+
+    ACCT_SUM_REQ_ID = 10000
+    PORTFOLIO_PRICE_REQ_ID = 30000
+    REFERENCE_PRICE_REQ_ID = 40000
 
     def _setup_log(self) -> Logger:
         log = getLogger(self.__class__.__name__)
@@ -132,11 +133,11 @@ class ARBApp(EWrapper, EClient):
         )
 
         self.log.info(
-            f"Updated account state; "
-            f"margin utilization = {self.acct_state.margin_utilization:.3f}; "
-            f"effective margin requirement = {self.acct_state.margin_req:.3f}; "
-            f"GPV={self.acct_state.gpv / 1000:.1f}k; "
-            f"EwLV={self.acct_state.ewlv / 1000:.1f}k"
+            f"Got acct. info: "
+            f"margin util. = {self.acct_state.margin_utilization * 100:.1f}%, "
+            f"margin req. = {self.acct_state.margin_req * 100:.1f}%, "
+            f"GPV={self.acct_state.gpv / 1000:.1f}k, "
+            f"EwLV={self.acct_state.ewlv / 1000:.1f}k."
         )
 
     @wrapper_override
@@ -179,7 +180,7 @@ class ARBApp(EWrapper, EClient):
 
             nc = NormedContract.normalize_contract(contract)
             if nc not in self.price_watchers:
-                req_id = self.PORTFOLIO_PRICE_REQID + len(self.price_watchers)
+                req_id = self.PORTFOLIO_PRICE_REQ_ID + len(self.price_watchers)
                 self.log.info(f"Subscribing ({req_id=}) to prices for {nc.symbol}.")
 
                 self.price_watchers[req_id] = nc
@@ -190,7 +191,7 @@ class ARBApp(EWrapper, EClient):
     def realtimeBar(
         self, req_id: TickerId, t: int, o: float, h: float, l: float, c: float, *_,
     ):
-        if req_id == self.REFERENCE_PRICE_REQID:
+        if req_id == self.REFERENCE_PRICE_REQ_ID:
             self.log.debug(f"Received reference price {c:.2f} at {t}.")
             self.ref_price = c
             self.ref_price_age = time.time() - t
@@ -276,68 +277,6 @@ class ARBApp(EWrapper, EClient):
 
         return large_enough_trade and sufficiently_misallocated
 
-    def rebalance_worker(self):
-
-        heartbeats = 0
-        while not self.workers_halt.is_set():
-
-            if not self.is_live:
-                if heartbeats == 4:
-                    self.kill_app("Unable to come alive in time.")
-                to_sleep = 1 + self.liveness_delay * heartbeats
-                {
-                    0: self.log.info,
-                    1: self.log.warning,
-                    2: self.log.error,
-                    3: self.log.fatal,
-                }[heartbeats](f"Not live yet. Sleeping {to_sleep}.")
-
-                time.sleep(to_sleep)
-                heartbeats += 1
-                continue
-
-            heartbeats = 0
-
-            target_mu = self.get_target_margin_use()
-            target_loan = self.acct_state.get_loan_at_target_utilization(target_mu)
-            funds = self.acct_state.ewlv + target_loan
-
-            close_prices = {
-                contract: ohlc.c for contract, ohlc in self.portfolio_prices.items()
-            }
-            model_alloc = find_closest_portfolio(
-                funds, self.conf_target_composition, close_prices
-            )
-
-            for nc in self.conf_target_composition.keys():
-                target_alloc = model_alloc[nc]
-                cur_alloc = self.portfolio[nc]
-                price = close_prices[nc]
-                if self.check_if_needs_rebalance(price, cur_alloc, target_alloc):
-                    self.rebalance_target[nc] = target_alloc - cur_alloc
-                else:
-                    self.rebalance_target.pop(nc, None)
-                    self.clear_any_untransmitted_order(nc)
-
-            self.log.info(
-                f"Target funds: ${funds / 1000:.1f}k "
-                f"(loan = ${(self.acct_state.ewlv - funds) / 1000:.1f}k), "
-                f"using {target_mu * 100:.1f}% of margin."
-            )
-
-            if len(self.rebalance_target) > 0:
-                self.log.info(
-                    f"Rebalance targets: "
-                    f"{{k.symbol: v for k, v in self.rebalance_target.items()}}."
-                )
-                for nc, order in self.construct_rebalance_orders().items():
-                    self.safe_place_order(nc, order)
-                self.order_manager.print_book()
-            else:
-                self.log.info("Balanced.")
-
-            time.sleep(60.0)
-
     def construct_rebalance_orders(self) -> Dict[NormedContract, Order]:
 
         total_amt = 0.0
@@ -398,11 +337,73 @@ class ARBApp(EWrapper, EClient):
         # TODO this is rather weak, but without a callback...
         time.sleep(0.1)
 
+    def rebalance_worker(self):
+
+        heartbeats = 0
+        while not self.workers_halt.is_set():
+
+            if not self.is_live:
+                if heartbeats == 4:
+                    self.kill_app("Unable to come alive in time.")
+                to_sleep = 1 + self.liveness_delay * heartbeats
+                {
+                    0: self.log.info,
+                    1: self.log.warning,
+                    2: self.log.error,
+                    3: self.log.fatal,
+                }[heartbeats](f"Not live yet. Sleeping {to_sleep}.")
+
+                time.sleep(to_sleep)
+                heartbeats += 1
+                continue
+
+            heartbeats = 0
+
+            target_mu = self.get_target_margin_use()
+            target_loan = self.acct_state.get_loan_at_target_utilization(target_mu)
+            funds = self.acct_state.ewlv + target_loan
+
+            close_prices = {
+                contract: ohlc.c for contract, ohlc in self.portfolio_prices.items()
+            }
+            model_alloc = find_closest_portfolio(
+                funds, self.conf_target_composition, close_prices
+            )
+
+            for nc in self.conf_target_composition.keys():
+                target_alloc = model_alloc[nc]
+                cur_alloc = self.portfolio[nc]
+                price = close_prices[nc]
+                if self.check_if_needs_rebalance(price, cur_alloc, target_alloc):
+                    self.rebalance_target[nc] = target_alloc - cur_alloc
+                else:
+                    self.rebalance_target.pop(nc, None)
+                    self.clear_any_untransmitted_order(nc)
+
+            self.log.info(
+                f"Target funds: ${funds / 1000:.1f}k "
+                f"(loan = ${(self.acct_state.ewlv - funds) / 1000:.1f}k), "
+                f"which uses {target_mu * 100:.1f}% of margin."
+            )
+
+            if len(self.rebalance_target) > 0:
+                self.log.info(
+                    f"Rebalance targets: "
+                    f"{{k.symbol: v for k, v in self.rebalance_target.items()}}."
+                )
+                for nc, order in self.construct_rebalance_orders().items():
+                    self.safe_place_order(nc, order)
+                self.order_manager.print_book()
+            else:
+                self.log.info("Balanced.")
+
+            time.sleep(60.0)
+
     def acct_update_worker(self):
 
         while not self.workers_halt.is_set():
             self.reqAccountSummary(
-                self.ACCT_SUM_REQID,
+                self.ACCT_SUM_REQ_ID,
                 "All",
                 "EquityWithLoanValue,GrossPositionValue,MaintMarginReq",
             )
@@ -443,12 +444,18 @@ class ARBApp(EWrapper, EClient):
 
             self.reqPositions()
             self.reqRealTimeBars(
-                self.REFERENCE_PRICE_REQID, self.ref_contract, 30, "MIDPOINT", False, []
+                self.REFERENCE_PRICE_REQ_ID,
+                self.ref_contract,
+                30,
+                "MIDPOINT",
+                False,
+                [],
             )
 
             rebalance_worker = Thread(target=self.rebalance_worker, daemon=True)
             rebalance_worker.start()
             rebalance_worker.join()
+
         finally:
             self.workers_halt.set()
             for nc in self.conf_target_composition.keys():
