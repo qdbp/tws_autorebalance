@@ -1,3 +1,4 @@
+import subprocess as sbp
 import sys
 import time
 from logging import getLogger, StreamHandler, Formatter, Logger, INFO, DEBUG
@@ -22,6 +23,7 @@ from src.data_model import (
     OrderManager,
     pp_order,
     OMState,
+    check_if_needs_rebalance,
 )
 from .finsec import SecurityFault, PERMIT_ERROR, Policy, audit_order
 
@@ -38,7 +40,6 @@ class ARBApp(EWrapper, EClient):
 
     ACCT_SUM_REQ_ID = 10000
     PORTFOLIO_PRICE_REQ_ID = 30000
-    REFERENCE_PRICE_REQ_ID = 40000
 
     def _setup_log(self) -> Logger:
         log = getLogger(self.__class__.__name__)
@@ -73,26 +74,19 @@ class ARBApp(EWrapper, EClient):
         self.position_acc: Dict[NormedContract, int] = {}
 
         # TODO move to config
+        # market config
         self.conf_target_composition = target_composition
-        self.conf_ref_price_ath: float = 160.0
+        self.conf_dd_reference_ath: float = 160.0
         self.conf_mu_at_ath: float = 0.0
         self.conf_dd_coef = 1.5
-        self.conf_rebalance_misalloc_min_amt = 500
-        self.conf_rebalance_misalloc_min_frac = 1.03
+        self.conf_misalloc_min_dollars = 500
+        self.conf_misalloc_min_frac = 1.03
         self.conf_min_margin_req = 0.25
 
         # control variables
-        # REBALANCE
-        self.ref_contract = Contract()
-        self.ref_contract.symbol = "SPY"
-        self.ref_contract.secType = "STK"
-        self.ref_contract.exchange = "SMART"
-        self.ref_contract.currency = "USD"
+        self.rebalance_every = 60.0
 
-        self.ref_price_age: float = float("inf")
-        self.ref_price: Optional[float] = None
-
-        self.liveness_timeout: float = 10.0
+        self.liveness_timeout = 10.0
         self.liveness_event: Event = Event()
 
         self.order_id_queue = Queue(maxsize=1)
@@ -192,15 +186,9 @@ class ARBApp(EWrapper, EClient):
     def realtimeBar(
         self, req_id: TickerId, t: int, o: float, h: float, l: float, c: float, *_,
     ):
-        if req_id == self.REFERENCE_PRICE_REQ_ID:
-            self.log.debug(f"Received reference price {c:.2f} at {t}.")
-            self.ref_price = c
-            self.ref_price_age = time.time() - t
-
-        elif (contract := self.price_watchers[req_id]) is not None:
+        if (contract := self.price_watchers[req_id]) is not None:
             self.log.debug(f"Received price for {contract.symbol}: {c:.2f}")
             self.portfolio_prices[contract] = OHLCBar(t, o, h, l, c)
-
         else:
             self.kill_app(f"Received unsolicited price {req_id=}")
 
@@ -259,7 +247,6 @@ class ARBApp(EWrapper, EClient):
             and self.acct_state.summary_age < Policy.MAX_ACCT_SUM_AGE
             and self.pricing_complete
             and self.pricing_age < Policy.MAX_PRICING_AGE
-            and self.ref_price_age < Policy.MAX_PRICING_AGE
         )
 
     def wait_until_live(self):
@@ -274,7 +261,7 @@ class ARBApp(EWrapper, EClient):
             self.conf_target_composition[nc] * self.portfolio_prices[nc].c
             for nc in self.conf_target_composition.keys()
         )
-        out = 1 - port_price / self.conf_ref_price_ath
+        out = 1 - port_price / self.conf_dd_reference_ath
         assert 0 <= out < 1
         return out
 
@@ -284,25 +271,6 @@ class ARBApp(EWrapper, EClient):
             self.conf_mu_at_ath + self.conf_dd_coef * self.effective_drawdown,
             Policy.MARGIN_USAGE.block_level - 0.01,
         )
-
-    def check_if_needs_rebalance(
-        self, price: float, cur_alloc: int, target_alloc: int
-    ) -> bool:
-
-        assert target_alloc >= 0
-        assert cur_alloc >= 1
-
-        if target_alloc == 0:
-            self.kill_app("Rebalance aims to zero position.")
-
-        d_dollars = price * abs(cur_alloc - target_alloc)
-        large_enough_trade = d_dollars >= self.conf_rebalance_misalloc_min_amt
-
-        f = self.conf_rebalance_misalloc_min_frac
-        assert f >= 1.0
-        sufficiently_misallocated = not (1 / f) < target_alloc / cur_alloc < f
-
-        return large_enough_trade and sufficiently_misallocated
 
     def construct_rebalance_orders(self) -> Dict[NormedContract, Order]:
 
@@ -388,7 +356,13 @@ class ARBApp(EWrapper, EClient):
                 cur_alloc = self.portfolio[nc]
                 price = close_prices[nc]
 
-                if self.check_if_needs_rebalance(price, cur_alloc, target_alloc):
+                if check_if_needs_rebalance(
+                    price,
+                    cur_alloc,
+                    target_alloc,
+                    misalloc_min_dollars=self.conf_misalloc_min_dollars,
+                    misalloc_min_fraction=self.conf_misalloc_min_frac,
+                ):
                     self.rebalance_target[nc] = target_alloc - cur_alloc
                 else:
                     self.rebalance_target.pop(nc, None)
@@ -418,7 +392,7 @@ class ARBApp(EWrapper, EClient):
                 )
                 self.log.info(f"Balanced. Ideal = {ideal_fmt}")
 
-            time.sleep(60.0)
+            time.sleep(self.rebalance_every)
 
     def acct_update_worker(self):
 
@@ -437,6 +411,8 @@ class ARBApp(EWrapper, EClient):
             else:
                 self.liveness_event.set()
             time.sleep(0.1)
+        else:
+            self.liveness_event.clear()
 
     @wrapper_override
     def error(self, req_id: TickerId, error_code: int, error_string: str):
@@ -470,14 +446,6 @@ class ARBApp(EWrapper, EClient):
             Thread(target=self.acct_update_worker, daemon=True).start()
 
             self.reqPositions()
-            self.reqRealTimeBars(
-                self.REFERENCE_PRICE_REQ_ID,
-                self.ref_contract,
-                30,
-                "MIDPOINT",
-                False,
-                [],
-            )
 
             rebalance_worker = Thread(target=self.rebalance_worker, daemon=True)
             rebalance_worker.start()

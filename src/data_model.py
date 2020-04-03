@@ -451,3 +451,25 @@ class OrderManager:
 
 def pp_order(nc: NormedContract, order: Order):
     return f"{order.action} {order.totalQuantity} {nc.symbol} ({order.orderType})"
+
+
+def check_if_needs_rebalance(
+    price: float,
+    cur_alloc: int,
+    target_alloc: int,
+    *,
+    misalloc_min_dollars: float,
+    misalloc_min_fraction: float,
+) -> bool:
+
+    assert target_alloc >= 1
+    assert cur_alloc >= 1
+
+    d_dollars = price * abs(cur_alloc - target_alloc)
+    large_enough_trade = d_dollars >= misalloc_min_dollars
+
+    f = misalloc_min_fraction
+    assert f >= 1.0
+    sufficiently_misallocated = not (1 / f) < target_alloc / cur_alloc < f
+
+    return large_enough_trade and sufficiently_misallocated
