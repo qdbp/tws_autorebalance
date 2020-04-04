@@ -11,10 +11,10 @@ import operator
 import sys
 from abc import abstractmethod
 from dataclasses import dataclass
-from logging import getLogger, INFO, StreamHandler, Formatter
+from logging import getLogger, INFO, StreamHandler, Formatter, Logger
 from numbers import Number
 from types import MappingProxyType
-from typing import TypeVar, Generic, Callable, Mapping, Literal
+from typing import TypeVar, Generic, Callable
 
 from colorama import Fore, init as init_colorama
 from ibapi.order import Order
@@ -33,7 +33,7 @@ PERMIT_ERROR = MappingProxyType(
 assert not set(PERMIT_ERROR.values()) - {"DEBUG", "INFO", "WARNING"}
 
 
-def init_sec_logger():
+def init_sec_logger() -> Logger:
     init_colorama()
 
     seclog = getLogger("FINSEC")
@@ -72,7 +72,7 @@ class ThreeTierGeneric(Generic[T]):
     confirm_msg: str
     cmp_op: Callable[[T, T], bool] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         assert self.cmp_op is not None
 
     def _confirm_danger(self, val: T) -> None:

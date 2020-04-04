@@ -148,7 +148,7 @@ class ARBApp(EWrapper, EClient):
         self.position_acc[nc] = int_pos
 
     @wrapper_override
-    def positionEnd(self):
+    def positionEnd(self) -> None:
 
         pos_data: Dict[NormedContract, int] = self.position_acc.copy()
         self.position_acc.clear()
@@ -249,7 +249,7 @@ class ARBApp(EWrapper, EClient):
             and self.pricing_age < Policy.MAX_PRICING_AGE
         )
 
-    def wait_until_live(self):
+    def wait_until_live(self) -> None:
         self.liveness_event.wait(self.liveness_timeout) or self.kill_app(
             "Unable to come alive in time."
         )
@@ -265,7 +265,7 @@ class ARBApp(EWrapper, EClient):
         assert 0 <= out < 1
         return out
 
-    def get_target_margin_use(self):
+    def get_target_margin_use(self) -> float:
         self.wait_until_live()
         return min(
             self.conf_mu_at_ath + self.conf_dd_coef * self.effective_drawdown,
@@ -335,7 +335,7 @@ class ARBApp(EWrapper, EClient):
     def notify_desktop(self, msg: str):
         sbp.run(("notify-send", "-t", str(int(self.rebalance_every * 990)), msg))
 
-    def rebalance_worker(self):
+    def rebalance_worker(self) -> None:
 
         while not self.workers_halt.is_set():
 
@@ -400,7 +400,7 @@ class ARBApp(EWrapper, EClient):
 
             time.sleep(self.rebalance_every)
 
-    def acct_update_worker(self):
+    def acct_update_worker(self) -> None:
 
         while not self.workers_halt.is_set():
             self.reqAccountSummary(
@@ -410,7 +410,7 @@ class ARBApp(EWrapper, EClient):
             )
             time.sleep(60.0)
 
-    def liveness_worker(self):
+    def liveness_worker(self) -> None:
         while not self.workers_halt.is_set():
             if not self.is_live:
                 self.liveness_event.clear()
@@ -440,7 +440,7 @@ class ARBApp(EWrapper, EClient):
         self.workers_halt.set()
         raise SecurityFault(msg)
 
-    def execute(self):
+    def execute(self) -> None:
         try:
             self.log.info("I awaken. Greed is good!")
 

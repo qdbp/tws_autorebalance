@@ -38,7 +38,7 @@ class Trade:
     fill_qty: int
     fill_px: float
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         assert self.fill_px >= 0
 
     def __le__(self, other: Trade):
@@ -175,7 +175,9 @@ class Composition(Dict[NormedContract, float]):
     guarantees component portions sum to 100%.
     """
 
-    def __init__(self, *args, do_normalize=False, **kwargs):
+    def __init__(
+        self, *args: object, do_normalize: object = False, **kwargs: object
+    ) -> None:
         super().__init__(*args, **kwargs)
 
         total = 0.0
@@ -269,7 +271,7 @@ class AcctState:
         return time.time() - self.created
 
     @property
-    def gpv(self):
+    def gpv(self) -> float:
         """Gross position value."""
         return self._gpv
 
@@ -279,7 +281,7 @@ class AcctState:
         self._gpv = gpv
 
     @property
-    def ewlv(self):
+    def ewlv(self) -> float:
         """Equity with loan value."""
         return self._ewlv
 
@@ -289,15 +291,15 @@ class AcctState:
         self._ewlv = ewlv
 
     @property
-    def margin_req(self):
+    def margin_req(self) -> float:
         return max(self.r0_safety_factor * self.r0 / self.gpv, self.min_margin_req)
 
     @property
-    def loan(self):
+    def loan(self) -> float:
         return self.gpv - self.ewlv
 
     @property
-    def margin_utilization(self):
+    def margin_utilization(self) -> float:
         return self.loan / ((1 - self.margin_req) * self.gpv)
 
     def get_loan_at_target_utilization(self, target_utilization: float) -> float:
@@ -436,7 +438,7 @@ class OrderManager:
     def get_order(self, nc: NormedContract) -> Optional[Order]:
         return self._orders.get(nc)
 
-    def print_book(self):
+    def print_book(self) -> None:
         for nc, state in self._order_state.items():
             msg = f"Order Book: {state}"
             if state == OMState.ENTERED or state == OMState.TRANSMITTED:
