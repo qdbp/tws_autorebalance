@@ -203,7 +203,7 @@ class ARBApp(EWrapper, EClient):
     def realtimeBar(
         self, req_id: TickerId, t: int, o: float, h: float, l: float, c: float, *_,
     ):
-        if (contract := self.price_watchers[req_id]) is not None:
+        if (contract := self.price_watchers.get(req_id)) is not None:
             self.log.debug(f"Received price for {contract.symbol}: {c:.2f}")
             self.portfolio_prices[contract] = OHLCBar(t, o, h, l, c)
         else:
