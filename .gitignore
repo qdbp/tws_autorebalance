@@ -5,6 +5,7 @@ __pycache__/
 
 secrets
 data
+/autorebalance.ini
 
 # C extensions
 *.so
@@ -94,4 +95,3 @@ ENV/
 
 **/.idea
 **.iml
-venv/

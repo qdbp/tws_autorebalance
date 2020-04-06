@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import time
+from configparser import ConfigParser
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from functools import total_ordering
+from inspect import signature
 from logging import Logger
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Callable, TypeVar
 
 import numpy as np
 import pulp
@@ -132,7 +134,6 @@ class NormedContract(Contract):
         return (
             self.currency,
             self.symbol,
-            self.exchange,
             self.secType,
         )
 
@@ -167,6 +168,16 @@ class NormedContract(Contract):
 
         # SMART is not a valid pex
         return out
+
+    @classmethod
+    def from_symbol_and_pex(cls, symbol: str, pex: str) -> NormedContract:
+        nc = NormedContract()
+        nc.symbol = symbol.upper()
+        nc.currency = "USD"
+        nc.secType = "STK"
+        nc.exchange = "SMART"
+        nc.primaryExchange = pex
+        return nc
 
 
 class Composition(Dict[NormedContract, float]):
@@ -210,15 +221,31 @@ class Composition(Dict[NormedContract, float]):
             for line in f.readlines():
                 items = line.strip().split(",")
 
-                c = Contract()
-                c.symbol = items[1]
-                c.secType = items[2]
-                c.exchange, c.primaryExchange = items[3].split("/")
-                c.currency = "USD"
+                symbol = items[0]
+                _, pex = items[3].split("/")
 
-                c = NormedContract.normalize_contract(c)
+                nc = NormedContract.from_symbol_and_pex(symbol, pex)
+                out[nc] = float(items[-1])
 
-                out[c] = float(items[-1])
+        return cls(out, do_normalize=True)
+
+    @classmethod
+    def parse_ini_composition(cls, parser: ConfigParser) -> Composition:
+        """
+        Parses a composition in the format of the configuration ini file.
+
+        There, each line looks like SYMBOL = PEX,10.0
+        where PEX is the primary exchange, and 10.0 can be any percentage composition.
+        """
+
+        section = parser["composition"]
+        out = {}
+        for key, item in section.items():
+
+            symbol = key.upper()
+            pex, scomp = item.split(",")
+            nc = NormedContract.from_symbol_and_pex(symbol, pex)
+            out[nc] = float(scomp)
 
         return cls(out, do_normalize=True)
 

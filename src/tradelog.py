@@ -3,16 +3,12 @@ from __future__ import annotations
 from collections import defaultdict
 from csv import reader
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from functools import total_ordering
 from numbers import Real
+from pathlib import Path
 from time import strptime
-from typing import (
-    List,
-    DefaultDict,
-    Iterable,
-    Optional,
-)
+from typing import List, DefaultDict, Iterable, Optional, Dict, Set
 
 import matplotlib.pyplot as plt
 from cycler import cycler
@@ -20,21 +16,21 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.ticker import MultipleLocator
 
-from src import PROJECT_ROOT
+from src import config
 from src.data_model import Trade
 
 
-def parse_tws_tradelog(fn: str) -> DefaultDict[str, List[Trade]]:
+def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
 
     prefix = "Trades,Data,Order,Stocks,USD,"
 
-    with open(fn, "r") as f:
+    with path.open("r") as f:
 
         lines = [
             l[len(prefix) :].strip() for l in f.readlines() if l.startswith(prefix)
         ]
 
-    out = defaultdict(list)
+    out = defaultdict(set)
 
     for line in reader(lines):
 
@@ -47,9 +43,19 @@ def parse_tws_tradelog(fn: str) -> DefaultDict[str, List[Trade]]:
         if qty == 0:
             continue
 
-        out[sym].append(Trade(t, sym, qty, price))
+        out[sym].add(Trade(t, sym, qty, price))
 
     return out
+
+
+def load_trade_logs() -> Dict[str, List[Trade]]:
+    trade_dir = Path(config()["trade_log"]["log_dir"]).expanduser()
+    all_trades = defaultdict(set)
+    for fn in trade_dir.glob("*.csv"):
+        fn_log = parse_tws_trade_log(fn)
+        for sym, trades in fn_log.items():
+            all_trades[sym] |= trades
+    return {sym: sorted(trades) for sym, trades in all_trades.items()}
 
 
 def sgn(x: Real) -> int:
@@ -151,6 +157,27 @@ class ProfitAttribution:
     start_time: datetime
     end_time: datetime
 
+    @property
+    def daily_attribution(self) -> Dict[date, float]:
+
+        """
+        Returns the profit of the span evenly divided between the intervening days,
+        inclusive of endpoints. Weekends and business holidays are included.
+        """
+
+        ix_date = self.start_time.date()
+        end_date = self.end_time.date()
+
+        out = {}
+        one_day = timedelta(days=1)
+        days_elapsed = 0
+        while ix_date <= end_date:
+            out[ix_date] = self.net_gain
+            ix_date += one_day
+            days_elapsed += 1
+        assert days_elapsed > 0
+        return {k: v / days_elapsed for k, v in out.items()}
+
     def __str__(self) -> str:
         return (
             f"ProfitAttr({self.symbol} : {self.net_gain:.2f} for "
@@ -164,6 +191,10 @@ class ProfitAttribution:
 class AttributionSet:
     def __init__(self, pas: Iterable[ProfitAttribution] = None):
         self.pas: List[ProfitAttribution] = sorted(pas) if pas is not None else []
+
+    def extend(self, pas: Iterable[ProfitAttribution]):
+        self.pas.extend(pas)
+        self.pas.sort()
 
     def get_total_for(self, symbol: str) -> Optional[ProfitAttribution]:
 
@@ -190,9 +221,15 @@ class AttributionSet:
             max(pa.end_time for pa in self.pas),
         )
 
-    def extend(self, pas: Iterable[ProfitAttribution]):
-        self.pas.extend(pas)
-        self.pas.sort()
+    def get_net_daily_attr(self) -> Dict[date, float]:
+        out = {}
+        for pa in self.pas:
+            pa_attr = pa.daily_attribution
+            for d, val in pa_attr.items():
+                out[d] = out.get(d, 0.0) + val
+        # TODO this is a pycharm bug
+        # noinspection PyTypeChecker
+        return dict(sorted(out.items()))
 
     def plot(self) -> Figure:
         fig: Figure = plt.figure()
@@ -236,10 +273,9 @@ class AttributionSet:
 
 if __name__ == "__main__":
 
-    trade_lists = parse_tws_tradelog(PROJECT_ROOT.joinpath("data/trades_ytd.csv"))
+    trade_logs = load_trade_logs()
     profit_attrs = {
-        sym: calculate_profit_attributions(trades)
-        for sym, trades in trade_lists.items()
+        sym: calculate_profit_attributions(trades) for sym, trades in trade_logs.items()
     }
 
     all_attrs = AttributionSet()
@@ -250,5 +286,11 @@ if __name__ == "__main__":
     print("Grand total trading profit:")
     print(all_attrs.get_grand_total())
 
-    fig = all_attrs.plot()
+    # fig = all_attrs.plot()
+    # plt.show()
+
+    net_attr = all_attrs.get_net_daily_attr()
+    dates, profits = zip(*net_attr.items())
+    plt.plot(dates, profits)
+    # plt.plot(dates, np.cumsum(profits))
     plt.show()

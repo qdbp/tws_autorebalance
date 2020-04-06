@@ -6,6 +6,10 @@ size, etc., are bounds-checked at the time of calculation.
 The goal is to ensure operational security and satisfaction of risk constraints. This
 differs and complements standard bounds-checking, which should still be used throughout
 to validate the mathematical soundness of program logic.
+
+In order to keep security policies as concise as possible, this module should not care
+if parameters are unreasonable in a non-dangerous direction. e.g. the rebalance
+threshold is so high the program never trades.
 """
 import operator
 import sys
@@ -182,6 +186,18 @@ class Policy:
     )
     ORDER_QTY = ThreeTierNMax("ORDER SIZE", 250, 100, 50, "Large order size.")
     ORDER_TOTAL = ThreeTierNMax("ORDER TOTAL", 10000, 2500, 1000, "Large order amount.")
+    MISALLOC_DOLLARS = ThreeTierNMin(
+        "MISALLOC $ MIN", 200, 400, 600, "Small dollar rebalance threshold."
+    )
+    MISALLOC_FRACTION = ThreeTierNMin(
+        "MISALLOC % MIN", 1.01, 1.03, 1.05, "Small dollar rebalance threshold."
+    )
+    ATH_MARGIN_USE = ThreeTierNMax(
+        "ATH MARGIN USER", 0.3, 0.2, 0.0, "High ATH margin usage."
+    )
+    DRAWDOWN_COEFFICIENT = ThreeTierNMax(
+        "DRAWDOWN COEFFICIENT", 2.0, 1.5, 0.5, "High drawdown coefficient."
+    )
 
     # number of seconds to wait before the same contract can be traded again
     ORDER_COOLOFF = 300

@@ -4,7 +4,7 @@ from ibapi.contract import Contract
 from src.data_model import find_closest_portfolio, Composition
 
 
-def test_allocator():
+def test_allocator() -> None:
 
     contracts = [Contract() for _ in range(10)]
     symbols = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]

@@ -25,6 +25,7 @@ from src.data_model import (
     OMState,
     check_if_needs_rebalance,
 )
+from . import config
 from .finsec import SecurityFault, PERMIT_ERROR, Policy, audit_order
 
 with open("./secrets/acct.txt") as f:
@@ -51,7 +52,7 @@ class ARBApp(EWrapper, EClient):
         )
         return log
 
-    def __init__(self, target_composition: Composition):
+    def __init__(self) -> None:
 
         self.log = self._setup_log()
 
@@ -73,15 +74,34 @@ class ARBApp(EWrapper, EClient):
         self.acc_sum_acc: Dict[str, float] = {}
         self.position_acc: Dict[NormedContract, int] = {}
 
-        # TODO move to config
         # market config
-        self.conf_target_composition = target_composition
-        self.conf_dd_reference_ath: float = 160.0
-        self.conf_mu_at_ath: float = 0.0
-        self.conf_dd_coef = 1.5
-        self.conf_misalloc_min_dollars = 500
-        self.conf_misalloc_min_frac = 1.03
-        self.conf_min_margin_req = 0.25
+        self.config = config()
+        self.target_composition = Composition.parse_ini_composition(self.config)
+        self.log.info("Loaded target composition:")
+        for k, v in self.target_composition.items():
+            self.log.info(f"{k} <- {v * 100:.2f}%")
+
+        strategy = self.config["strategy"]
+        self.log.info("Loaded strategy:")
+        for k, v in strategy.items():
+            self.log.info(f"{k} = {v}")
+
+        self.conf_dd_reference_ath: float = float(strategy["dd_reference_ath"])
+        self.conf_mu_at_ath: float = Policy.ATH_MARGIN_USE.validate(
+            float(strategy["mu_at_ath"])
+        )
+        self.conf_dd_coef = Policy.DRAWDOWN_COEFFICIENT.validate(
+            float(strategy["dd_coef"])
+        )
+        self.conf_misalloc_min_dollars = Policy.MISALLOC_DOLLARS.validate(
+            int(strategy["misalloc_min_dollars"])
+        )
+        self.conf_misalloc_min_frac = Policy.MISALLOC_FRACTION.validate(
+            float(strategy["misalloc_min_frac"])
+        )
+        self.conf_min_margin_req = Policy.MARGIN_REQ.validate(
+            float(strategy["min_margin_req"])
+        )
 
         # control variables
         self.rebalance_every = 60.0
@@ -166,7 +186,7 @@ class ARBApp(EWrapper, EClient):
 
         # correct bad primary exchanges in our composition
         for k in self.portfolio.keys():
-            for kc in self.conf_target_composition.keys():
+            for kc in self.target_composition.keys():
                 if k == kc:
                     kc.primaryExchange = k.primaryExchange
                     break
@@ -258,8 +278,8 @@ class ARBApp(EWrapper, EClient):
     def effective_drawdown(self) -> float:
         self.wait_until_live()
         port_price = sum(
-            self.conf_target_composition[nc] * self.portfolio_prices[nc].c
-            for nc in self.conf_target_composition.keys()
+            self.target_composition[nc] * self.portfolio_prices[nc].c
+            for nc in self.target_composition.keys()
         )
         out = 1 - port_price / self.conf_dd_reference_ath
         assert 0 <= out < 1
@@ -349,12 +369,12 @@ class ARBApp(EWrapper, EClient):
                 contract: ohlc.c for contract, ohlc in self.portfolio_prices.items()
             }
             model_alloc = find_closest_portfolio(
-                funds, self.conf_target_composition, close_prices
+                funds, self.target_composition, close_prices
             )
 
             ideal_allocation_delta = {}
 
-            for nc in self.conf_target_composition.keys():
+            for nc in self.target_composition.keys():
                 target_alloc = model_alloc[nc]
                 cur_alloc = self.portfolio[nc]
                 price = close_prices[nc]
@@ -459,7 +479,7 @@ class ARBApp(EWrapper, EClient):
 
         finally:
             self.workers_halt.set()
-            for nc in self.conf_target_composition.keys():
+            for nc in self.target_composition.keys():
                 self.clear_any_untransmitted_order(nc)
             self.log.info("Disconnecting. I hope I didn't lose too much money!")
             self.disconnect()
