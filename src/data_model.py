@@ -21,7 +21,7 @@ import src.finsec as sec
 np.set_printoptions(precision=2)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class OHLCBar:
     __slots__ = ("t", "o", "h", "l", "c")
     t: int
@@ -31,8 +31,7 @@ class OHLCBar:
     c: float
 
 
-@total_ordering
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class Trade:
     __slots__ = ("time", "sym", "fill_qty", "fill_px")
     time: datetime
@@ -42,9 +41,6 @@ class Trade:
 
     def __post_init__(self) -> None:
         assert self.fill_px >= 0
-
-    def __le__(self, other: Trade):
-        return self.time <= other.time
 
     def __str__(self) -> str:
         return (
