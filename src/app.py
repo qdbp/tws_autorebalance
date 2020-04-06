@@ -193,7 +193,7 @@ class ARBApp(EWrapper, EClient):
 
         for contract in pos_data.keys():
             nc = NormedContract.normalize_contract(contract)
-            if nc not in self.price_watchers:
+            if nc not in self.price_watchers.values():
                 req_id = self.PORTFOLIO_PRICE_REQ_ID + len(self.price_watchers)
                 self.log.info(f"Subscribing ({req_id=}) to prices for {nc.symbol}.")
                 self.price_watchers[req_id] = nc
