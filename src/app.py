@@ -1,6 +1,9 @@
-import subprocess as sbp
+from __future__ import annotations
+
 import sys
 import time
+from configparser import ConfigParser
+from dataclasses import dataclass, fields
 from logging import getLogger, StreamHandler, Formatter, Logger, INFO, DEBUG
 from math import isclose
 from queue import Queue, Full
@@ -37,6 +40,59 @@ def wrapper_override(f: Callable):
     return f
 
 
+@dataclass(frozen=True)
+class AppConfig:
+
+    # strategy
+    dd_reference_ath: float
+    mu_at_ath: float
+    dd_coef: float
+    misalloc_min_dollars: int
+    misalloc_min_frac: float
+    min_margin_req: float
+
+    # app
+    rebalance_freq: float
+    liveness_freq: float
+    liveness_timeout: float
+    armed: bool
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            assert getattr(self, field.name) is not None
+
+    @classmethod
+    def read_config(cls, cfg: ConfigParser) -> AppConfig:
+
+        strategy = cfg["strategy"]
+
+        return cls(
+            # strategy
+            dd_reference_ath=strategy.getfloat("dd_reference_ath"),
+            mu_at_ath=Policy.ATH_MARGIN_USE.validate(strategy.getfloat("mu_at_ath")),
+            dd_coef=Policy.DRAWDOWN_COEFFICIENT.validate(strategy.getfloat("dd_coef")),
+            misalloc_min_dollars=Policy.MISALLOC_DOLLARS.validate(
+                strategy.getint("misalloc_min_dollars")
+            ),
+            misalloc_min_frac=Policy.MISALLOC_FRACTION.validate(
+                strategy.getfloat("misalloc_min_frac")
+            ),
+            min_margin_req=Policy.MARGIN_REQ.validate(
+                strategy.getfloat("min_margin_req")
+            ),
+            # app
+            rebalance_freq=cfg["app"].getfloat("rebalance_freq"),
+            liveness_freq=cfg["app"].getfloat("liveness_freq"),
+            liveness_timeout=cfg["app"].getfloat("liveness_timeout"),
+            armed=cfg["app"].getbool("armed"),
+        )
+
+    def dump_config(self) -> str:
+        return "\n".join(
+            f"{field.name}={getattr(self, field.name)}" for field in fields(self)
+        )
+
+
 class ARBApp(EWrapper, EClient):
 
     ACCT_SUM_REQ_ID = 10000
@@ -48,7 +104,7 @@ class ARBApp(EWrapper, EClient):
         log.setLevel(INFO)
         log.addHandler(StreamHandler(sys.stdout))
         log.handlers[0].setFormatter(
-            Formatter("{asctime} {levelname:1s} ∷ {message}", style="{")
+            Formatter("{asctime} {levelname:1s}@{funcName} ∷ {message}", style="{")
         )
         return log
 
@@ -75,40 +131,15 @@ class ARBApp(EWrapper, EClient):
         self.position_acc: Dict[NormedContract, int] = {}
 
         # market config
-        self.config = config()
-        self.target_composition = Composition.parse_ini_composition(self.config)
+        self.target_composition = Composition.parse_ini_composition(config())
         self.log.info("Loaded target composition:")
         for k, v in self.target_composition.items():
             self.log.info(f"{k} <- {v * 100:.2f}%")
 
-        strategy = self.config["strategy"]
-        self.log.info("Loaded strategy:")
-        for k, v in strategy.items():
-            self.log.info(f"{k} = {v}")
+        self.conf = AppConfig.read_config(config())
+        self.log.info(f"Running with the following config:\n{self.conf.dump_config()}")
 
-        self.conf_dd_reference_ath: float = float(strategy["dd_reference_ath"])
-        self.conf_mu_at_ath: float = Policy.ATH_MARGIN_USE.validate(
-            float(strategy["mu_at_ath"])
-        )
-        self.conf_dd_coef = Policy.DRAWDOWN_COEFFICIENT.validate(
-            float(strategy["dd_coef"])
-        )
-        self.conf_misalloc_min_dollars = Policy.MISALLOC_DOLLARS.validate(
-            int(strategy["misalloc_min_dollars"])
-        )
-        self.conf_misalloc_min_frac = Policy.MISALLOC_FRACTION.validate(
-            float(strategy["misalloc_min_frac"])
-        )
-        self.conf_min_margin_req = Policy.MARGIN_REQ.validate(
-            float(strategy["min_margin_req"])
-        )
-
-        # control variables
-        self.rebalance_every = 60.0
-
-        self.liveness_timeout = 10.0
         self.liveness_event: Event = Event()
-
         self.order_id_queue = Queue(maxsize=1)
         self.order_manager = OrderManager(log=self.log)
 
@@ -144,7 +175,7 @@ class ARBApp(EWrapper, EClient):
         r0 = acct_data["MaintMarginReq"]
 
         self.acct_state = AcctState(
-            gpv=gpv, ewlv=ewlv, r0=r0, min_margin_req=self.conf_min_margin_req,
+            gpv=gpv, ewlv=ewlv, r0=r0, min_margin_req=self.conf.min_margin_req,
         )
 
         self.log.info(
@@ -272,7 +303,7 @@ class ARBApp(EWrapper, EClient):
         )
 
     def wait_until_live(self) -> None:
-        self.liveness_event.wait(self.liveness_timeout) or self.kill_app(
+        self.liveness_event.wait(self.conf.liveness_timeout) or self.kill_app(
             "Unable to come alive in time."
         )
 
@@ -283,14 +314,14 @@ class ARBApp(EWrapper, EClient):
             self.target_composition[nc] * self.portfolio_prices[nc].c
             for nc in self.target_composition.keys()
         )
-        out = 1 - port_price / self.conf_dd_reference_ath
+        out = 1 - port_price / self.conf.dd_reference_ath
         assert 0 <= out < 1
         return out
 
     def get_target_margin_use(self) -> float:
         self.wait_until_live()
         return min(
-            self.conf_mu_at_ath + self.conf_dd_coef * self.effective_drawdown,
+            self.conf.mu_at_ath + self.conf.dd_coef * self.effective_drawdown,
             Policy.MARGIN_USAGE.block_level - 0.01,
         )
 
@@ -355,7 +386,8 @@ class ARBApp(EWrapper, EClient):
         time.sleep(0.1)
 
     def notify_desktop(self, msg: str):
-        sbp.run(("notify-send", "-t", str(int(self.rebalance_every * 990)), msg))
+        # sbp.run(("notify-send", "-t", str(int(self.rebalance_every * 990)), msg))
+        pass
 
     def rebalance_worker(self) -> None:
 
@@ -385,8 +417,8 @@ class ARBApp(EWrapper, EClient):
                     price,
                     cur_alloc,
                     target_alloc,
-                    misalloc_min_dollars=self.conf_misalloc_min_dollars,
-                    misalloc_min_fraction=self.conf_misalloc_min_frac,
+                    misalloc_min_dollars=self.conf.misalloc_min_dollars,
+                    misalloc_min_fraction=self.conf.misalloc_min_frac,
                 ):
                     self.rebalance_target[nc] = target_alloc - cur_alloc
                 else:
@@ -420,7 +452,7 @@ class ARBApp(EWrapper, EClient):
                 )
                 self.log.info(f"Balanced. Ideal = {ideal_fmt}")
 
-            time.sleep(self.rebalance_every)
+            time.sleep(self.conf.rebalance_freq)
 
     def acct_update_worker(self) -> None:
 
@@ -465,6 +497,10 @@ class ARBApp(EWrapper, EClient):
     def execute(self) -> None:
         try:
             self.log.info("I awaken. Greed is good!")
+            if self.conf.armed:
+                self.log.warning(
+                    Fore.RED + "I am armed. " + Fore.CYAN + "I love you!" + Fore.RESET
+                )
 
             self.connect("127.0.0.1", 7496, clientId=1337)
             Thread(target=self.run, daemon=True).start()
