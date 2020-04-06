@@ -190,7 +190,7 @@ class Policy:
         "MISALLOC $ MIN", 200, 400, 600, "Small dollar rebalance threshold."
     )
     MISALLOC_FRACTION = ThreeTierNMin(
-        "MISALLOC % MIN", 1.01, 1.03, 1.05, "Small dollar rebalance threshold."
+        "MISALLOC % MIN", 1.01, 1.03, 1.05, "Small position rebalance threshold."
     )
     ATH_MARGIN_USE = ThreeTierNMax(
         "ATH MARGIN USER", 0.3, 0.2, 0.0, "High ATH margin usage."
