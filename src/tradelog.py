@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from cycler import cycler
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import MultipleLocator, FixedLocator, FuncFormatter
 
 from src import config
 from src.data_model import Trade
@@ -74,7 +74,10 @@ def shrink(x: int, d: int) -> int:
 
 
 def calculate_profit_attributions(
-    trades: List[Trade], start: datetime = None, end: datetime = None
+    trades: List[Trade],
+    start: datetime = None,
+    end: datetime = None,
+    go_backwards: bool = False,
 ) -> Tuple[List[ProfitAttribution], int]:
     """
     Convert a list of trades into ProfitAttributions, matching opposite-side trades
@@ -113,7 +116,7 @@ def calculate_profit_attributions(
     open_positions: List[Trade] = []
     profit_attr: List[ProfitAttribution] = []
 
-    for close_tr in sorted(trades):
+    for close_tr in sorted(trades)[:: -1 if go_backwards else 1]:
 
         # this is an invariant that should be maintained by the attribution algorithm.
         assert all(p.fill_qty < 0 for p in open_positions) or all(
@@ -126,7 +129,10 @@ def calculate_profit_attributions(
         while open_positions:
 
             open_tr = open_positions.pop()
-            assert open_tr.time < close_tr.time
+            if go_backwards:
+                assert open_tr.time > close_tr.time
+            else:
+                assert open_tr.time < close_tr.time
 
             # (some of) the query trade closes (some of) the latest position
             if open_tr.fill_qty * close_tr.fill_qty < 0:
@@ -205,8 +211,8 @@ class ProfitAttribution:
         inclusive of endpoints. Weekends and business holidays are included.
         """
 
-        ix_date = self.start_time.date()
-        end_date = self.end_time.date()
+        ix_date = min(self.start_time, self.end_time)
+        end_date = max(self.start_time, self.end_time)
 
         out = {}
         one_day = timedelta(days=1)
@@ -298,7 +304,7 @@ class AttributionSet:
 
         col_cyc = plt.rcParams["axes.prop_cycle"].by_key()["color"]
         cyc = (
-            cycler(lw=[0.5, 1.0, 2.0])
+            cycler(lw=[2.0, 3.0])
             * cycler(linestyle=["-", ":", "--", "-."])
             * cycler(color=col_cyc)
         )
@@ -317,7 +323,7 @@ class AttributionSet:
                 continue
             ax.plot(
                 [pa.start_time, pa.end_time],
-                [pl := (sgn(pa.net_gain) * np.log(abs(pa.net_gain))), pl],
+                [pl := (sgn(pa.net_gain) * np.log10(abs(pa.net_gain))), pl],
                 **styles[ixes[sym]],
                 label=sym
                 if (sym not in have_labelled and (have_labelled.add(sym) or 1))
@@ -329,8 +335,14 @@ class AttributionSet:
         ax.set_ylabel("LOG Profit/Loss (only height matters, not area under curve!)")
         ax.set_xlabel("Open/Close dates of trades.")
         ax.grid(which="major")
-        ax.yaxis.set_minor_locator(MultipleLocator(100))
+        ax.yaxis.set_major_locator(FixedLocator([0.0]))
+        ax.yaxis.set_minor_locator(MultipleLocator(0.5))
+        ax.yaxis.set_major_formatter(
+            FuncFormatter(lambda x, _: f"{sgn(x) * 10 ** abs(x):.1f}")
+        )
+        ax.yaxis.set_minor_formatter(ax.yaxis.get_major_formatter())
         ax.xaxis.set_minor_locator(MultipleLocator(1))
+        ax.grid(axis="y", which="major", lw=3.0, color="k")
         ax.grid(which="minor", lw=0.25)
         fig.set_size_inches((12, 8))
         return fig
@@ -343,13 +355,15 @@ if __name__ == "__main__":
     np.set_printoptions(precision=2)
 
     end = datetime(2021, 5, 1)
-    start = datetime(2020, 2, 1)
+    start = datetime(2020, 3, 1)
 
     trade_logs = load_trade_logs()
     profit_attrs = {}
     open_positions = {}
     for sym, trades in trade_logs.items():
-        attrs, net = calculate_profit_attributions(trades, start=start, end=end)
+        attrs, net = calculate_profit_attributions(
+            trades, start=start, end=end, go_backwards=True
+        )
         profit_attrs[sym] = attrs
         open_positions[sym] = net
 
@@ -362,10 +376,6 @@ if __name__ == "__main__":
     print("Grand total trading profit:")
     print(all_attrs.get_grand_total())
 
-    # include_symbols = set()
-    # for p in all_attrs.pas_by_profit:
-    #     if abs(p.net_gain) > 100:
-    #         include_symbols.add(p.symbol)
     for k, v in sorted(open_positions.items()):
         if abs(v) > 0:
             print(f"Open {k} = {v}")
@@ -374,8 +384,8 @@ if __name__ == "__main__":
     fig = all_attrs.plot()
     plt.show()
 
-    # net_attr = all_attrs.get_net_daily_attr()
-    # dates, profits = zip(*net_attr.items())
-    # plt.plot(dates, profits)
+    net_attr = all_attrs.get_net_daily_attr()
+    dates, profits = zip(*net_attr.items())
+    plt.plot(dates, profits)
     # plt.plot(dates, np.cumsum(profits))
-    # plt.show()
+    plt.show()
