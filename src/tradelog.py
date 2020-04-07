@@ -8,7 +8,7 @@ from functools import total_ordering
 from numbers import Real
 from pathlib import Path
 from time import strptime
-from typing import List, DefaultDict, Iterable, Optional, Dict, Set
+from typing import List, DefaultDict, Iterable, Optional, Dict, Set, Tuple
 
 import matplotlib.pyplot as plt
 from cycler import cycler
@@ -34,11 +34,16 @@ def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
 
     for line in reader(lines):
 
-        sym, tstr, sqty, sprice, *_ = line
+        sym, tstr, sqty, sprice, _, scomm, *_ = line
 
         t = datetime(*strptime(tstr, "%Y-%m-%d, %H:%M:%S")[:6])
-        qty = int(sqty)
+
+        qty = int(sqty.replace(",", ""))
         price = float(sprice)
+        comm_paid = -float(scomm)
+
+        # if qty < 0, we lower price; else we increase.
+        price += comm_paid / qty
 
         if qty == 0:
             continue
@@ -68,10 +73,40 @@ def shrink(x: int, d: int) -> int:
     return sgn(x) * (abs(x) - d)
 
 
-def calculate_profit_attributions(trades: List[Trade]) -> List[ProfitAttribution]:
+def calculate_profit_attributions(
+    trades: List[Trade], start: datetime = None, end: datetime = None
+) -> Tuple[List[ProfitAttribution], int]:
+    """
+    Convert a list of trades into ProfitAttributions, matching opposite-side trades
+    in a LIFO fashion. Returns this list and the net unmatched position.
+
+    First, a stack S of "unmatched" trades is initialized.
+    Going through the trades from earliest to latest, if the current trade t matches
+    the sign of the top of S, or if S is empty, t is added to the stack. Otherwise
+    the trades (partially) cancel, and a profit attribution is created from the
+    difference. If top(S) is only partially cancelled, the remainder is returned to
+    the top of the stack. If t is only partially cancelled, the process continues with
+    the remainder t' until it is either cancelled or added to the stack, at which point
+    the next trade from the list of unprocessed trades is drawn. This continues until
+    all trades have been processed.
+
+    Args:
+        trades: the trades to match into ProfitAttributions.
+        start: only trades from this time onward will be considered.
+        end: only trades through this point will be considered.
+
+    Returns:
+        the list of generated ProfitAttributions, and the net open position.
+    """
+
+    trades = [
+        tr
+        for tr in trades
+        if (start is None or tr.time >= start) and (end is None or tr.time <= end)
+    ]
 
     if len(trades) < 2:
-        return []
+        return [], 0
 
     sym = trades[0].sym
 
@@ -113,7 +148,9 @@ def calculate_profit_attributions(trades: List[Trade]) -> List[ProfitAttribution
                     qty_attributed = abs(open_tr.fill_qty)
                     net_gain = qty_attributed * px_diff
                     profit_attr.append(
-                        ProfitAttribution(sym, net_gain, open_tr.time, close_tr.time)
+                        ProfitAttribution(
+                            sym, net_gain, qty_attributed, open_tr.time, close_tr.time
+                        )
                     )
                     new_qty = shrink(close_tr.fill_qty, qty_attributed)
                     # unless the two cancel exactly, in which case we get the next trade
@@ -127,7 +164,9 @@ def calculate_profit_attributions(trades: List[Trade]) -> List[ProfitAttribution
                     qty_attributed = abs(close_tr.fill_qty)
                     net_gain = qty_attributed * px_diff
                     profit_attr.append(
-                        ProfitAttribution(sym, net_gain, open_tr.time, close_tr.time)
+                        ProfitAttribution(
+                            sym, net_gain, qty_attributed, open_tr.time, close_tr.time
+                        )
                     )
                     new_qty = shrink(open_tr.fill_qty, qty_attributed)
                     new_prev_trade = replace(open_tr, fill_qty=new_qty)
@@ -145,7 +184,7 @@ def calculate_profit_attributions(trades: List[Trade]) -> List[ProfitAttribution
         else:
             open_positions.append(close_tr)
 
-    return profit_attr
+    return profit_attr, sum(t.fill_qty for t in open_positions)
 
 
 @total_ordering
@@ -154,6 +193,7 @@ class ProfitAttribution:
 
     symbol: str
     net_gain: float
+    qty: int
     start_time: datetime
     end_time: datetime
 
@@ -180,9 +220,11 @@ class ProfitAttribution:
 
     def __str__(self) -> str:
         return (
-            f"ProfitAttr({self.symbol} : {self.net_gain:.2f} for "
+            f"ProfitAttr({self.symbol} x {self.qty}: {self.net_gain:.2f} for "
             f"[{self.start_time}, {self.end_time}]"
         )
+
+    __repr__ = __str__
 
     def __lt__(self, other: ProfitAttribution):
         return (self.symbol, self.start_time) < (other.symbol, other.start_time)
@@ -205,6 +247,7 @@ class AttributionSet:
         return ProfitAttribution(
             symbol,
             sum(pa.net_gain for pa in sym_pas),
+            sum(pa.qty for pa in sym_pas),
             min(pa.start_time for pa in sym_pas),
             max(pa.end_time for pa in sym_pas),
         )
@@ -217,6 +260,7 @@ class AttributionSet:
         return ProfitAttribution(
             "__TOTAL__",
             sum(pa.net_gain for pa in self.pas),
+            sum(pa.qty for pa in self.pas),
             min(pa.start_time for pa in self.pas),
             max(pa.end_time for pa in self.pas),
         )
@@ -231,28 +275,49 @@ class AttributionSet:
         # noinspection PyTypeChecker
         return dict(sorted(out.items()))
 
-    def plot(self) -> Figure:
+    @property
+    def all_symbols(self) -> Set[str]:
+        return {pa.symbol for pa in self.pas}
+
+    @property
+    def pas_by_start(self) -> List[ProfitAttribution]:
+        return sorted(self.pas, key=lambda pa: pa.start_time)
+
+    @property
+    def pas_by_end(self) -> List[ProfitAttribution]:
+        return sorted(self.pas, key=lambda pa: pa.end_time)
+
+    @property
+    def pas_by_profit(self) -> List[ProfitAttribution]:
+        return sorted(self.pas, key=lambda pa: pa.net_gain)
+
+    def plot(self, only_symbols: Set[str] = None) -> Figure:
+
         fig: Figure = plt.figure()
         ax: Axes = fig.subplots()
 
         col_cyc = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-        print(col_cyc)
-        cyc = cycler(color=col_cyc) * cycler(linestyle=["-", ":"])
+        cyc = (
+            cycler(lw=[0.5, 1.0, 2.0])
+            * cycler(linestyle=["-", ":", "--", "-."])
+            * cycler(color=col_cyc)
+        )
+
+        include_symbols = self.all_symbols & (
+            self.all_symbols if only_symbols is None else only_symbols
+        )
 
         styles = list(cyc)
-        ixes = {
-            sym: ix for ix, sym in enumerate(sorted({pa.symbol for pa in self.pas}))
-        }
-
+        ixes = {sym: ix for ix, sym in enumerate(sorted(include_symbols))}
         have_labelled = set()
 
         for pa in self.pas:
             sym = pa.symbol
-            if sym == "ZROZ":
+            if sym not in include_symbols:
                 continue
             ax.plot(
                 [pa.start_time, pa.end_time],
-                [pa.net_gain, pa.net_gain],
+                [pl := (sgn(pa.net_gain) * np.log(abs(pa.net_gain))), pl],
                 **styles[ixes[sym]],
                 label=sym
                 if (sym not in have_labelled and (have_labelled.add(sym) or 1))
@@ -261,7 +326,7 @@ class AttributionSet:
 
         ax.legend()
         ax.set_title("Day Trades Profit-Span Plot")
-        ax.set_ylabel("Profit/Loss (only height matters, not area under curve!)")
+        ax.set_ylabel("LOG Profit/Loss (only height matters, not area under curve!)")
         ax.set_xlabel("Open/Close dates of trades.")
         ax.grid(which="major")
         ax.yaxis.set_minor_locator(MultipleLocator(100))
@@ -273,24 +338,44 @@ class AttributionSet:
 
 if __name__ == "__main__":
 
+    import numpy as np
+
+    np.set_printoptions(precision=2)
+
+    end = datetime(2021, 5, 1)
+    start = datetime(2020, 2, 1)
+
     trade_logs = load_trade_logs()
-    profit_attrs = {
-        sym: calculate_profit_attributions(trades) for sym, trades in trade_logs.items()
-    }
+    profit_attrs = {}
+    open_positions = {}
+    for sym, trades in trade_logs.items():
+        attrs, net = calculate_profit_attributions(trades, start=start, end=end)
+        profit_attrs[sym] = attrs
+        open_positions[sym] = net
 
     all_attrs = AttributionSet()
-    for sym, atts in profit_attrs.items():
-        all_attrs.extend(atts)
-        print(all_attrs.get_total_for(sym))
+    for sym, attrs in profit_attrs.items():
+        all_attrs.extend(attrs)
+        if attrs:
+            print(all_attrs.get_total_for(sym))
 
     print("Grand total trading profit:")
     print(all_attrs.get_grand_total())
 
-    # fig = all_attrs.plot()
-    # plt.show()
+    # include_symbols = set()
+    # for p in all_attrs.pas_by_profit:
+    #     if abs(p.net_gain) > 100:
+    #         include_symbols.add(p.symbol)
+    for k, v in sorted(open_positions.items()):
+        if abs(v) > 0:
+            print(f"Open {k} = {v}")
 
-    net_attr = all_attrs.get_net_daily_attr()
-    dates, profits = zip(*net_attr.items())
-    plt.plot(dates, profits)
-    # plt.plot(dates, np.cumsum(profits))
+    # fig = all_attrs.plot(only_symbols=include_symbols)
+    fig = all_attrs.plot()
     plt.show()
+
+    # net_attr = all_attrs.get_net_daily_attr()
+    # dates, profits = zip(*net_attr.items())
+    # plt.plot(dates, profits)
+    # plt.plot(dates, np.cumsum(profits))
+    # plt.show()
