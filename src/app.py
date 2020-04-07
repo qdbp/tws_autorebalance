@@ -4,11 +4,11 @@ import sys
 import time
 from configparser import ConfigParser
 from dataclasses import dataclass, fields
-from logging import getLogger, StreamHandler, Formatter, Logger, INFO, DEBUG
+from logging import getLogger, StreamHandler, Formatter, Logger, INFO
 from math import isclose
 from queue import Queue, Full
 from threading import Event, Thread
-from typing import Optional, Dict, Callable
+from typing import Optional, Dict, Callable, Tuple
 
 from colorama import Fore
 from ibapi.client import EClient
@@ -81,10 +81,10 @@ class AppConfig:
                 strategy.getfloat("min_margin_req")
             ),
             # app
-            rebalance_freq=cfg["app"].getfloat("rebalance_freq"),
-            liveness_freq=cfg["app"].getfloat("liveness_freq"),
-            liveness_timeout=cfg["app"].getfloat("liveness_timeout"),
-            armed=cfg["app"].getboolean("armed"),
+            rebalance_freq=cfg["app"].getfloat("rebalance_freq", 60.0),
+            liveness_freq=cfg["app"].getfloat("liveness_freq", 0.1),
+            liveness_timeout=cfg["app"].getfloat("liveness_timeout", 10.0),
+            armed=cfg["app"].getboolean("armed", False),
         )
 
     def dump_config(self) -> str:
@@ -100,7 +100,6 @@ class ARBApp(EWrapper, EClient):
 
     def _setup_log(self) -> Logger:
         log = getLogger(self.__class__.__name__)
-        log.setLevel(DEBUG)
         log.setLevel(INFO)
         log.addHandler(StreamHandler(sys.stdout))
         log.handlers[0].setFormatter(
@@ -136,7 +135,7 @@ class ARBApp(EWrapper, EClient):
         for k, v in self.target_composition.items():
             self.log.info(f"{k} <- {v * 100:.2f}%")
 
-        self.conf = AppConfig.read_config(config())
+        self.conf: AppConfig = AppConfig.read_config(config())
         self.log.info(f"Running with the following config:\n{self.conf.dump_config()}")
 
         self.liveness_event: Event = Event()
@@ -145,7 +144,7 @@ class ARBApp(EWrapper, EClient):
 
     @wrapper_override
     def nextValidId(self, order_id: int):
-        # this is called on the first invocation.
+        # this is called once on app startup.
         if not self.initialized.is_set():
             self.initialized.set()
             return
@@ -406,7 +405,7 @@ class ARBApp(EWrapper, EClient):
                 funds, self.target_composition, close_prices
             )
 
-            ideal_allocation_delta = {}
+            ideal_allocation_delta: Dict[str, Tuple[int, float, float]] = {}
 
             for nc in self.target_composition.keys():
                 target_alloc = model_alloc[nc]
@@ -426,7 +425,11 @@ class ARBApp(EWrapper, EClient):
                     self.clear_any_untransmitted_order(nc)
 
                 if target_alloc != cur_alloc:
-                    ideal_allocation_delta[nc.symbol] = target_alloc - cur_alloc
+                    ideal_allocation_delta[nc.symbol] = (
+                        delta := (target_alloc - cur_alloc),
+                        abs(delta) * price,
+                        max(1 - target_alloc / cur_alloc, 1 - cur_alloc / target_alloc),
+                    )
 
             self.log.info(
                 f"Target funds: ${funds / 1000:.1f}k "
@@ -447,8 +450,11 @@ class ARBApp(EWrapper, EClient):
                 self.notify_desktop(rebalance_msg)
             else:
                 ideal_fmt = ", ".join(
-                    f"{sym}{'+' if num > 0 else '-'}{abs(num)}"
-                    for sym, num in ideal_allocation_delta.items()
+                    f"{sym}{'+' if delta > 0 else '-'}{abs(delta)}"
+                    f"(${dollars:.0f}/{frac*100:.1f}%)"
+                    for sym, (delta, dollars, frac) in sorted(
+                        ideal_allocation_delta.items(), key=lambda x: -x[1][1]
+                    )
                 )
                 self.log.info(f"Balanced. Ideal = {ideal_fmt}")
 
