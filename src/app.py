@@ -84,7 +84,7 @@ class AppConfig:
             rebalance_freq=cfg["app"].getfloat("rebalance_freq"),
             liveness_freq=cfg["app"].getfloat("liveness_freq"),
             liveness_timeout=cfg["app"].getfloat("liveness_timeout"),
-            armed=cfg["app"].getbool("armed"),
+            armed=cfg["app"].getboolean("armed"),
         )
 
     def dump_config(self) -> str:
