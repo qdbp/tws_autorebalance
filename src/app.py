@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 from configparser import ConfigParser
@@ -186,6 +187,8 @@ class ARBApp(EWrapper, EClient):
             f"GPV={self.acct_state.gpv / 1000:.1f}k, "
             f"EwLV={self.acct_state.ewlv / 1000:.1f}k."
         )
+        if self.conf.armed:
+            self.log.warning(Fore.RED + "I am armed." + Fore.RESET)
 
     @wrapper_override
     def position(
@@ -399,8 +402,9 @@ class ARBApp(EWrapper, EClient):
         time.sleep(0.1)
 
     def notify_desktop(self, msg: str):
-        # sbp.run(("notify-send", "-t", str(int(self.rebalance_every * 990)), msg))
-        pass
+        subprocess.run(
+            ("notify-send", "-t", str(int(self.conf.rebalance_freq * 990)), msg)
+        )
 
     def rebalance_worker(self) -> None:
 
@@ -451,6 +455,15 @@ class ARBApp(EWrapper, EClient):
                 f"which uses {target_mu * 100:.2f}% of margin."
             )
 
+            ideal_fmt = ", ".join(
+                f"{sym}{'+' if delta > 0 else '-'}{abs(delta)}"
+                f"(${dollars:.0f}/{frac * 100:.1f}%)"
+                for sym, (delta, dollars, frac) in sorted(
+                    ideal_allocation_delta.items(), key=lambda x: -x[1][1]
+                )
+            )
+            self.log.info(f"Ideal alloc = {ideal_fmt}")
+
             if len(self.rebalance_target) > 0:
                 self.log.info(
                     rebalance_msg := (
@@ -463,14 +476,7 @@ class ARBApp(EWrapper, EClient):
                 self.order_manager.print_book()
                 self.notify_desktop(rebalance_msg)
             else:
-                ideal_fmt = ", ".join(
-                    f"{sym}{'+' if delta > 0 else '-'}{abs(delta)}"
-                    f"(${dollars:.0f}/{frac*100:.1f}%)"
-                    for sym, (delta, dollars, frac) in sorted(
-                        ideal_allocation_delta.items(), key=lambda x: -x[1][1]
-                    )
-                )
-                self.log.info(f"Balanced. Ideal = {ideal_fmt}")
+                self.log.info("Balanced.")
 
             time.sleep(self.conf.rebalance_freq)
 
@@ -541,5 +547,3 @@ class ARBApp(EWrapper, EClient):
                 self.clear_any_untransmitted_order(nc)
             self.log.info("Disconnecting. I hope I didn't lose too much money!")
             self.disconnect()
-
-
