@@ -211,7 +211,7 @@ class Policy:
 def audit_order(order: Order) -> Order:
 
     succ = order.orderType == "MIDPRICE"
-    succ &= config()['app'].getboolean('armed') or not order.transmit
+    succ &= config()["app"].getboolean("armed") or not order.transmit
 
     if not succ:
         raise SecurityFault(f"{order} failed audit.")
