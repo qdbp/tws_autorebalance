@@ -4,6 +4,7 @@ import sys
 import time
 from configparser import ConfigParser
 from dataclasses import dataclass, fields
+from datetime import datetime
 from logging import getLogger, StreamHandler, Formatter, Logger, INFO
 from math import isclose
 from queue import Queue, Full
@@ -17,19 +18,19 @@ from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.wrapper import EWrapper
 
-from src.data_model import (
-    AcctState,
-    OHLCBar,
-    Composition,
-    NormedContract,
-    find_closest_portfolio,
-    OrderManager,
-    pp_order,
-    OMState,
-    check_if_needs_rebalance,
-)
 from . import config
 from .finsec import SecurityFault, PERMIT_ERROR, Policy, audit_order
+from .model.calc import find_closest_portfolio, check_if_needs_rebalance
+from .model.data import (
+    OHLCBar,
+    Trade,
+    NormedContract,
+    Composition,
+    AcctState,
+    OMState,
+    OrderManager,
+)
+from .model.util import pp_order
 
 with open("./secrets/acct.txt") as f:
     ACCT = f.read()
@@ -123,6 +124,7 @@ class ARBApp(EWrapper, EClient):
         self.price_watchers: Dict[int, NormedContract] = {}
         self.portfolio: Optional[Dict[NormedContract, int]] = None
         self.portfolio_prices: Dict[NormedContract, OHLCBar] = {}
+        self.last_trade: Dict[NormedContract, Trade] = {}
 
         # accumulator variables
         self.rebalance_target: Dict[NormedContract, int] = {}
@@ -241,7 +243,13 @@ class ARBApp(EWrapper, EClient):
 
     @wrapper_override
     def orderStatus(
-        self, oid: int, status: str, filled: float, rem: float, av_fill_px: float, *_,
+        self,
+        oid: int,
+        status: str,
+        filled_qty: float,
+        rem: float,
+        av_fill_px: float,
+        *_,
     ):
         # this assumes that for an order X, orderStatus will never be called again
         # more than COOLOFF seconds after the finalization call for X.
@@ -267,6 +275,12 @@ class ARBApp(EWrapper, EClient):
         if status == "Filled":
             assert self.order_manager.finalize_order(nc)
             self.log.info(f"Order for {pp_order(nc, order)} finalized.")
+            self.last_trade[nc] = Trade(
+                time=datetime.utcnow(),
+                price=av_fill_px,
+                qty=(-1 if order.action == "SELL" else 1) * int(filled_qty),
+                sym=nc.symbol,
+            )
             self.reqPositions()
         else:
             self.log.info(f"Order status for {pp_order(nc, order)}: {status}")
@@ -527,3 +541,5 @@ class ARBApp(EWrapper, EClient):
                 self.clear_any_untransmitted_order(nc)
             self.log.info("Disconnecting. I hope I didn't lose too much money!")
             self.disconnect()
+
+

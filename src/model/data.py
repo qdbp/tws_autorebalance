@@ -3,22 +3,24 @@ from __future__ import annotations
 import time
 from configparser import ConfigParser
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from enum import Enum, auto
 from functools import total_ordering
-from inspect import signature
 from logging import Logger
-from typing import Optional, Dict, Tuple, Callable, TypeVar
+from typing import Tuple, Dict, Optional, Iterable, List, Set
 
 import numpy as np
-import pulp
+from cycler import cycler
 from ibapi.contract import Contract
 from ibapi.order import Order
-from pulp_lparray import lparray
+from matplotlib import pyplot as plt
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+from matplotlib.ticker import FixedLocator, MultipleLocator, FuncFormatter
 
-import src.finsec as sec
-
-np.set_printoptions(precision=2)
+from src import finsec as sec
+from src.model.math import sgn
+from src.model.util import pp_order
 
 
 @dataclass(frozen=True, order=True)
@@ -33,82 +35,264 @@ class OHLCBar:
 
 @dataclass(frozen=True, order=True)
 class Trade:
-    __slots__ = ("time", "sym", "fill_qty", "fill_px")
-    time: datetime
+    __slots__ = ("sym", "time", "qty", "price")
+
     sym: str
-    fill_qty: int
-    fill_px: float
+    time: datetime
+    qty: int
+    price: float
 
     def __post_init__(self) -> None:
-        assert self.fill_px >= 0
+        assert self.price >= 0
 
     def __str__(self) -> str:
         return (
-            f"Trade({self.sym} Δ{self.fill_qty} @ "
-            f"{self.fill_px} @ {datetime(*self.time[:6])}"
+            f"Trade({'＋' if self.qty > 0 else '－'} {self.sym:<4s} "
+            f"$[{abs(self.qty):>3.0f} x {self.price:.3f}] @ {self.time})"
         )
 
 
-def find_closest_portfolio(
-    funds: float, composition: Composition, prices: Dict[Contract, float],
-) -> Dict[Contract, int]:
+@dataclass(frozen=True, order=True)
+class Position:
     """
-    Constructs the most closely-matching concrete, integral-share Portfolio matching
-    this Allocation.
+    This class represents a position in a contract.
 
-    It is guaranteed that portfolio.gpv <= allocation.
+    The contract is identified by its symbol, and can have either a positive or
+    negative number of open units at a given average price.
 
-    Using a MILP solver might be overkill for this, but we do, ever-so-rarely, round
-    the other way from the target (fractional) allocation. This lets us do that
-    correctly without guesswork. Can't be too careful with money.
-
-    :param funds: total amount of money available to spend on the portfolio.
-    :param composition: the target composition to approximate
-    :param prices: the assumed prices of the securities.
-    :return: a mapping from contacts to allocated share counts.
+    In addition to the contract position, a cash credit field is associated to the
+    Position as an accounting convenience when netting trades against the position. The
+    debit field allows, for instance, to calculate the net realized cash of a sequence
+    of trades.
     """
 
-    # will raise if a price is missing
-    comp_arr, price_arr = np.array(
-        [[composition[c], prices[c]] for c in composition.keys()]
-    ).T
+    __slots__ = ("sym", "av_price", "qty", "credit")
 
-    assert np.isclose(comp_arr.sum(), 1.0)
-    assert len(composition) == len(prices)
+    sym: str
+    av_price: float
+    qty: int
+    credit: float
 
-    target_alloc = funds * comp_arr / price_arr
+    def __post_init__(self) -> None:
+        assert self.av_price >= 0
 
-    prob = pulp.LpProblem(sense=pulp.LpMinimize)
+    @classmethod
+    def empty(cls, sym: str) -> Position:
+        return Position(sym, 0.0, 0, 0.0)
 
-    alloc = lparray.create_anon("Alloc", shape=comp_arr.shape, cat=pulp.LpInteger)
+    def transact(self, trade: Trade) -> Position:
+        assert trade.sym == self.sym
 
-    (alloc >= 0).constrain(prob, "NonNegativePositions")
+        qp, qt = abs(self.qty), abs(trade.qty)
 
-    cost = (alloc @ price_arr).sum()
-    (cost <= funds).constrain(prob, "DoNotExceedFunds")
+        # same sign: weighted average of prices
+        if sgn(self.qty) == sgn(trade.qty):
+            new_av_price = (qp * self.av_price + qt * trade.price) / (qp + qt)
+        # different sign, trade doesn't cancel position, price unchanged
+        elif qt < qp:
+            new_av_price = self.av_price
+        # trade zeros position, set price to zero as nominal indicator
+        elif qt == qp:
+            new_av_price = 0.0
+        # else the position is totally inverted, and the new price is that of the trade
+        else:
+            new_av_price = trade.price
 
-    # TODO bigM here should be the maximum possible value of alloc - target_alloc
-    # while 100k should be enough for reasonable uses, we can figure out a proper max
-    loss = (
-        # rescale by inverse composition to punish relative deviations equally
-        ((alloc - target_alloc) * (1 / comp_arr))
-        .abs(prob, "Loss", bigM=1_000_000)
-        .sumit()
-    )
-    prob += loss
+        return Position(
+            sym=self.sym,
+            av_price=new_av_price,
+            qty=trade.qty + self.qty,
+            credit=self.credit - trade.qty * trade.price,
+        )
 
-    pulp.COIN().solve(prob)
+    @property
+    def basis(self) -> float:
+        return self.qty * self.av_price
 
-    assert "Infeasible" != (status := pulp.LpStatus[prob.status])
+    @property
+    def book_nlv(self) -> float:
+        """
+        The net liquidation value of the portfolio at book value.
+        """
+        return self.credit + self.qty * self.av_price
 
-    # this means the solver was interrupted -- we propagate that up
-    if "Not Solved" == status:
-        raise KeyboardInterrupt
+    def __str__(self) -> str:
+        return (
+            f"Position[{self.sym:<4s} x {self.qty: 4d} "
+            f"@ {self.av_price:7.3f} ${'(' if self.credit < 0 else ' '}"
+            f"{abs(self.credit):6,.0f}{')' if self.credit < 0 else ' '}]"
+        )
 
-    normed_misalloc = loss.value() / funds
-    sec.Policy.MISALLOCATION.validate(normed_misalloc)
 
-    return {c: int(v) for c, v in zip(composition.keys(), alloc.values)}
+class Portfolio:
+    def __init__(self) -> None:
+        self._positions: Dict[str, Position] = {}
+
+    def transact(self, trade: Trade):
+        self._positions[trade.sym] = self._positions.get(
+            trade.sym, Position.empty(trade.sym)
+        ).transact(trade)
+
+    @property
+    def book_nlv(self) -> float:
+        return sum(pos.book_nlv for pos in self._positions.values())
+
+    @property
+    def credit(self) -> float:
+        return sum(pos.credit for pos in self._positions.values())
+
+
+@dataclass(frozen=True, order=True)
+class ProfitAttribution:
+
+    __slots__ = ("symbol", "start_time", "end_time", "qty", "net_gain")
+
+    symbol: str
+    start_time: datetime
+    end_time: datetime
+    qty: int
+    net_gain: float
+
+    @property
+    def daily_attribution(self) -> Dict[date, float]:
+
+        """
+        Returns the profit of the span evenly divided between the intervening days,
+        inclusive of endpoints. Weekends and business holidays are included.
+        """
+
+        ix_date = min(self.start_time, self.end_time).date()
+        end_date = max(self.start_time, self.end_time).date()
+
+        out = {}
+        one_day = timedelta(days=1)
+        days_elapsed = 0
+        while ix_date <= end_date:
+            out[ix_date] = self.net_gain
+            ix_date += one_day
+            days_elapsed += 1
+        assert days_elapsed > 0
+        return {k: v / days_elapsed for k, v in out.items()}
+
+    def __str__(self) -> str:
+        return (
+            f"ProfitAttr({self.symbol} x {self.qty}: {self.net_gain:.2f} for "
+            f"[{self.start_time}, {self.end_time}]"
+        )
+
+    __repr__ = __str__
+
+
+class AttributionSet:
+    def __init__(self, pas: Iterable[ProfitAttribution] = None):
+        self.pas: List[ProfitAttribution] = sorted(pas) if pas is not None else []
+
+    def extend(self, pas: Iterable[ProfitAttribution]):
+        self.pas.extend(pas)
+        self.pas.sort()
+
+    def get_total_for(self, symbol: str) -> Optional[ProfitAttribution]:
+
+        sym_pas = sorted(pa for pa in self.pas if pa.symbol == symbol)
+        if not sym_pas:
+            return None
+
+        return ProfitAttribution(
+            symbol,
+            min(pa.start_time for pa in sym_pas),
+            max(pa.end_time for pa in sym_pas),
+            sum(pa.net_gain for pa in sym_pas),
+            sum(pa.qty for pa in sym_pas),
+        )
+
+    def get_grand_total(self) -> Optional[ProfitAttribution]:
+
+        if not self.pas:
+            return None
+
+        return ProfitAttribution(
+            "__TOTAL__",
+            min(pa.start_time for pa in self.pas),
+            max(pa.end_time for pa in self.pas),
+            sum(pa.net_gain for pa in self.pas),
+            sum(pa.qty for pa in self.pas),
+        )
+
+    def get_net_daily_attr(self) -> Dict[date, float]:
+        out = {}
+        for pa in self.pas:
+            pa_attr = pa.daily_attribution
+            for d, val in pa_attr.items():
+                out[d] = out.get(d, 0.0) + val
+        # TODO this is a pycharm bug
+        # noinspection PyTypeChecker
+        return dict(sorted(out.items()))
+
+    @property
+    def all_symbols(self) -> Set[str]:
+        return {pa.symbol for pa in self.pas}
+
+    @property
+    def pas_by_start(self) -> List[ProfitAttribution]:
+        return sorted(self.pas, key=lambda pa: pa.start_time)
+
+    @property
+    def pas_by_end(self) -> List[ProfitAttribution]:
+        return sorted(self.pas, key=lambda pa: pa.end_time)
+
+    @property
+    def pas_by_profit(self) -> List[ProfitAttribution]:
+        return sorted(self.pas, key=lambda pa: pa.net_gain)
+
+    def plot(self, only_symbols: Set[str] = None) -> Figure:
+
+        fig: Figure = plt.figure()
+        ax: Axes = fig.subplots()
+
+        col_cyc = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        cyc = (
+            cycler(lw=[2.0, 3.0])
+            * cycler(linestyle=["-", ":", "--", "-."])
+            * cycler(color=col_cyc)
+        )
+
+        include_symbols = self.all_symbols & (
+            self.all_symbols if only_symbols is None else only_symbols
+        )
+
+        styles = list(cyc)
+        ixes = {sym: ix for ix, sym in enumerate(sorted(include_symbols))}
+        have_labelled = set()
+
+        for pa in self.pas:
+            sym = pa.symbol
+            if sym not in include_symbols:
+                continue
+            ax.plot(
+                [pa.start_time, pa.end_time],
+                [pl := (sgn(pa.net_gain) * np.log10(abs(pa.net_gain))), pl],
+                **styles[ixes[sym]],
+                label=sym
+                if (sym not in have_labelled and (have_labelled.add(sym) or 1))
+                else None,
+            )
+
+        ax.legend()
+        ax.set_title("Day Trades Profit-Span Plot")
+        ax.set_ylabel("LOG Profit/Loss (only height matters, not area under curve!)")
+        ax.set_xlabel("Open/Close dates of trades.")
+        ax.grid(which="major")
+        ax.yaxis.set_major_locator(FixedLocator([0.0]))
+        ax.yaxis.set_minor_locator(MultipleLocator(0.5))
+        ax.yaxis.set_major_formatter(
+            FuncFormatter(lambda x, _: f"{sgn(x) * 10 ** abs(x):.1f}")
+        )
+        ax.yaxis.set_minor_formatter(ax.yaxis.get_major_formatter())
+        ax.xaxis.set_minor_locator(MultipleLocator(1))
+        ax.grid(axis="y", which="major", lw=3.0, color="k")
+        ax.grid(which="minor", lw=0.25)
+        fig.set_size_inches((12, 8))
+        return fig
 
 
 @total_ordering
@@ -472,29 +656,3 @@ class OrderManager:
 
     def __getitem__(self, nc: NormedContract) -> OMState:
         return self.get_state(nc)
-
-
-def pp_order(nc: NormedContract, order: Order):
-    return f"{order.action} {order.totalQuantity} {nc.symbol} ({order.orderType})"
-
-
-def check_if_needs_rebalance(
-    price: float,
-    cur_alloc: int,
-    target_alloc: int,
-    *,
-    misalloc_min_dollars: float,
-    misalloc_min_fraction: float,
-) -> bool:
-
-    assert target_alloc >= 1
-    assert cur_alloc >= 1
-
-    d_dollars = price * abs(cur_alloc - target_alloc)
-    large_enough_trade = d_dollars >= misalloc_min_dollars
-
-    f = misalloc_min_fraction
-    assert f >= 1.0
-    sufficiently_misallocated = not (1 / f) < target_alloc / cur_alloc < f
-
-    return large_enough_trade and sufficiently_misallocated

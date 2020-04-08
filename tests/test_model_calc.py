@@ -1,7 +1,10 @@
 import numpy as np
+from _pytest.python_api import raises
 from ibapi.contract import Contract
 
-from src.data_model import find_closest_portfolio, Composition
+from src.model.calc import find_closest_portfolio
+from src.model.data import Composition
+from src.model.math import shrink
 
 
 def test_allocator() -> None:
@@ -29,3 +32,17 @@ def test_allocator() -> None:
 
     print(comp_arr / comp_arr.sum() * funds / price_arr)
     print(alloc)
+
+
+def test_shrink() -> None:
+
+    assert shrink(-5, 1) == -4
+    assert shrink(-5, 5) == 0
+    assert shrink(0, 0) == 0
+    assert shrink(5, 1) == 4
+    assert shrink(5, 0) == 5
+
+    with raises(AssertionError):
+        shrink(-5, -1)
+    with raises(AssertionError):
+        shrink(10, 11)
