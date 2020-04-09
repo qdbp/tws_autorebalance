@@ -9,7 +9,7 @@ from pulp_lparray import lparray
 
 from src import finsec as sec
 from src.model.data import Composition, Trade, ProfitAttribution
-from src.model.math import shrink
+from src.model.math import shrink, sgn
 
 
 def find_closest_portfolio(
@@ -81,17 +81,22 @@ def check_if_needs_rebalance(
     *,
     misalloc_min_dollars: float,
     misalloc_min_fraction: float,
+    misalloc_frac_elbow: float,
+    misalloc_frac_coef: float,
 ) -> bool:
 
     assert target_alloc >= 1
     assert cur_alloc >= 1
+    assert misalloc_frac_elbow > misalloc_min_fraction > 1.0
+    assert misalloc_frac_coef >= 0.0
 
-    d_dollars = price * abs(cur_alloc - target_alloc)
+    misalloc_frac = max(target_alloc / cur_alloc, cur_alloc / target_alloc)
+    sufficiently_misallocated = misalloc_frac > misalloc_min_fraction
+
+    d_dollars = price * abs(cur_alloc - target_alloc) + misalloc_frac_coef * max(
+        0.0, 100 * (misalloc_frac - misalloc_frac_elbow)
+    )
     large_enough_trade = d_dollars >= misalloc_min_dollars
-
-    f = misalloc_min_fraction
-    assert f >= 1.0
-    sufficiently_misallocated = not (1 / f) < target_alloc / cur_alloc < f
 
     return large_enough_trade and sufficiently_misallocated
 
@@ -154,67 +159,41 @@ def calculate_profit_attributions(
         assert close_tr.qty != 0
 
         while open_positions:
-
             open_tr = open_positions.pop()
             if go_backwards:
                 assert open_tr.time > close_tr.time
             else:
                 assert open_tr.time < close_tr.time
 
-            # (some of) the query trade closes (some of) the latest position
-            if open_tr.qty * close_tr.qty < 0:
-                # accounting is symmetric with respect to long/short positions.
-                # i.e. a more recent buy is considered closing a short and a more
-                # recent sell is considered closing a long
-                if open_tr.qty > 0:
-                    bot_px = open_tr.price
-                    sld_px = close_tr.price
-                else:
-                    bot_px = close_tr.price
-                    sld_px = open_tr.price
-
-                px_diff = sld_px - bot_px
-
-                # if we closed more than accounted for by the latest open position, we
-                # remove that position from the stack and continue with an abated query
-                if abs(open_tr.qty) <= abs(close_tr.qty):
-                    qty_attributed = abs(open_tr.qty)
-                    net_gain = qty_attributed * px_diff
-                    profit_attr.append(
-                        ProfitAttribution(
-                            sym, open_tr.time, close_tr.time, qty_attributed, net_gain
-                        )
-                    )
-                    new_qty = shrink(close_tr.qty, qty_attributed)
-                    # unless the two cancel exactly, in which case we get the next trade
-                    if new_qty == 0:
-                        break
-                    close_tr = replace(close_tr, qty=new_qty)
-                    continue  # traversing the open positions to attribute the rest
-
-                # the latest trade doesn't fully close the latest open position
-                else:
-                    qty_attributed = abs(close_tr.qty)
-                    net_gain = qty_attributed * px_diff
-                    profit_attr.append(
-                        ProfitAttribution(
-                            sym, open_tr.time, close_tr.time, qty_attributed, net_gain
-                        )
-                    )
-                    new_qty = shrink(open_tr.qty, qty_attributed)
-                    new_prev_trade = replace(open_tr, qty=new_qty)
-                    open_positions.append(new_prev_trade)
-                    break  # because we've exhausted the current query
-
-            # the query trade opens more of the position
-            else:
+            # close_tr doesn't close anything and is added to the position.
+            if sgn(open_tr.qty) == sgn(close_tr.qty):
                 open_positions.append(open_tr)
                 open_positions.append(close_tr)
                 break  # get new trade
 
+            # (some of) the query trade closes (some of) the latest position
+            qo, qc = abs(open_tr.qty), abs(close_tr.qty)
+            to, tc = open_tr.time, close_tr.time
+
+            sell_px = open_tr.price if open_tr.qty < 0 else close_tr.price
+            buy_px = open_tr.price if open_tr.qty > 0 else close_tr.price
+            net_gain = (sell_px - buy_px) * min(qo, qc)
+
+            profit_attr.append(ProfitAttribution(sym, to, tc, min(qo, qc), net_gain))
+
+            # remove open; shrink close, check against next open, if any
+            if qo < qc:
+                close_tr = replace(close_tr, qty=shrink(close_tr.qty, qo))
+                continue
+            # shrink open and remove close; get next close from list
+            if qo > qc:
+                abated_open_tr = replace(open_tr, qty=shrink(open_tr.qty, qc))
+                open_positions.append(abated_open_tr)
+            break
+
         # the current open positions list is empty -- the remainder of the query is
         # added as an open position
-        else:
+        else:  # not open_positions
             open_positions.append(close_tr)
 
     return profit_attr, sum(t.qty for t in open_positions)

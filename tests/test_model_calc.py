@@ -3,7 +3,7 @@ from _pytest.python_api import raises
 from ibapi.contract import Contract
 
 from src.model.calc import find_closest_portfolio
-from src.model.data import Composition
+from src.model.data import Composition, NormedContract
 from src.model.math import shrink
 
 
@@ -14,17 +14,21 @@ def test_allocator() -> None:
 
     for c, s in zip(contracts, symbols):
         c.symbol = s
+        c.secType = "STK"
 
     comp_arr = np.array(
         [12.08, 18.13, 12.08, 6.04, 6.04, 6.04, 9.06, 6.04, 36.25, 9.06]
     )
 
-    composition = Composition(
-        {k: v for k, v in zip(contracts, comp_arr / comp_arr.sum())}
-    )
+    nc_dict = {
+        NormedContract.normalize_contract(k): v
+        for k, v in zip(contracts, comp_arr / comp_arr.sum())
+    }
+
+    composition = Composition.from_dict(nc_dict)
 
     price_arr = np.array([52, 172, 153, 54, 9, 23, 56, 95, 231, 55], dtype=np.float32)
-    prices = {k: v for k, v in zip(contracts, price_arr)}
+    prices = {k: v for k, v in zip(nc_dict.keys(), price_arr)}
 
     funds = 100_000
 

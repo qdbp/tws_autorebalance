@@ -7,6 +7,7 @@ from datetime import datetime, date, timedelta
 from enum import Enum, auto
 from functools import total_ordering
 from logging import Logger
+from math import isclose
 from typing import Tuple, Dict, Optional, Iterable, List, Set
 
 import numpy as np
@@ -44,6 +45,7 @@ class Trade:
 
     def __post_init__(self) -> None:
         assert self.price >= 0
+        assert abs(self.qty) > 0
 
     def __str__(self) -> str:
         return (
@@ -126,20 +128,20 @@ class Position:
 
 class Portfolio:
     def __init__(self) -> None:
-        self._positions: Dict[str, Position] = {}
+        self.positions: Dict[str, Position] = {}
 
-    def transact(self, trade: Trade):
-        self._positions[trade.sym] = self._positions.get(
+    def transact(self, trade: Trade) -> None:
+        self.positions[trade.sym] = self.positions.get(
             trade.sym, Position.empty(trade.sym)
         ).transact(trade)
 
     @property
     def book_nlv(self) -> float:
-        return sum(pos.book_nlv for pos in self._positions.values())
+        return sum(pos.book_nlv for pos in self.positions.values())
 
     @property
     def credit(self) -> float:
-        return sum(pos.credit for pos in self._positions.values())
+        return sum(pos.credit for pos in self.positions.values())
 
 
 @dataclass(frozen=True, order=True)
@@ -187,7 +189,7 @@ class AttributionSet:
     def __init__(self, pas: Iterable[ProfitAttribution] = None):
         self.pas: List[ProfitAttribution] = sorted(pas) if pas is not None else []
 
-    def extend(self, pas: Iterable[ProfitAttribution]):
+    def extend(self, pas: Iterable[ProfitAttribution]) -> None:
         self.pas.extend(pas)
         self.pas.sort()
 
@@ -201,10 +203,11 @@ class AttributionSet:
             symbol,
             min(pa.start_time for pa in sym_pas),
             max(pa.end_time for pa in sym_pas),
-            sum(pa.net_gain for pa in sym_pas),
             sum(pa.qty for pa in sym_pas),
+            sum(pa.net_gain for pa in sym_pas),
         )
 
+    @property
     def get_grand_total(self) -> Optional[ProfitAttribution]:
 
         if not self.pas:
@@ -214,12 +217,13 @@ class AttributionSet:
             "__TOTAL__",
             min(pa.start_time for pa in self.pas),
             max(pa.end_time for pa in self.pas),
-            sum(pa.net_gain for pa in self.pas),
             sum(pa.qty for pa in self.pas),
+            sum(pa.net_gain for pa in self.pas),
         )
 
-    def get_net_daily_attr(self) -> Dict[date, float]:
-        out = {}
+    @property
+    def net_daily_attr(self) -> Dict[date, float]:
+        out: Dict[date, float] = {}
         for pa in self.pas:
             pa_attr = pa.daily_attribution
             for d, val in pa_attr.items():
@@ -268,13 +272,18 @@ class AttributionSet:
             sym = pa.symbol
             if sym not in include_symbols:
                 continue
+
+            if sym in have_labelled:
+                label = None
+            else:
+                label = sym
+                have_labelled.add(sym)
+
             ax.plot(
                 [pa.start_time, pa.end_time],
                 [pl := (sgn(pa.net_gain) * np.log10(abs(pa.net_gain))), pl],
                 **styles[ixes[sym]],
-                label=sym
-                if (sym not in have_labelled and (have_labelled.add(sym) or 1))
-                else None,
+                label=label
             )
 
         ax.legend()
@@ -302,7 +311,7 @@ class NormedContract(Contract):
     standardizations to make it suitable for use as a dictionary key.
     """
 
-    def __eq__(self, other: NormedContract) -> bool:
+    def __eq__(self, other: object) -> bool:
 
         if not isinstance(other, NormedContract):
             raise ValueError()
@@ -366,24 +375,26 @@ class Composition(Dict[NormedContract, float]):
     guarantees component portions sum to 100%.
     """
 
-    def __init__(
-        self, *args: object, do_normalize: object = False, **kwargs: object
-    ) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, d: Dict[NormedContract, float]):
+        super().__init__(d)
 
-        total = 0.0
-        for k, v in self.items():
-            assert isinstance(k, Contract)
+    @classmethod
+    def from_dict(
+        cls, d: Dict[NormedContract, float], do_normalize: bool = False
+    ) -> Composition:
+        for k, v in d.items():
+            assert isinstance(k, NormedContract)
             assert isinstance(v, float)
-            total += v
 
-        assert total > 0.0
+        total = sum(d.values())
+        if do_normalize:
+            for k in d.keys():
+                d[k] /= total
 
-        if not do_normalize:
-            assert np.isclose(total, 1.0)
-        else:
-            for k in self.keys():
-                self[k] /= total
+        elif not isclose(total, 1.0):
+            raise ValueError
+
+        return cls(d)
 
     @classmethod
     def parse_tws_composition(cls, fn: str) -> Composition:
@@ -407,7 +418,7 @@ class Composition(Dict[NormedContract, float]):
                 nc = NormedContract.from_symbol_and_pex(symbol, pex)
                 out[nc] = float(items[-1])
 
-        return cls(out, do_normalize=True)
+        return cls.from_dict(out, do_normalize=True)
 
     @classmethod
     def parse_ini_composition(cls, parser: ConfigParser) -> Composition:
@@ -427,7 +438,7 @@ class Composition(Dict[NormedContract, float]):
             nc = NormedContract.from_symbol_and_pex(symbol, pex)
             out[nc] = float(scomp)
 
-        return cls(out, do_normalize=True)
+        return cls.from_dict(out, do_normalize=True)
 
 
 class AcctState:
@@ -441,7 +452,7 @@ class AcctState:
         gpv: float,
         ewlv: float,
         r0: float,
-        min_margin_req: 0.25,
+        min_margin_req: float = 0.25,
         r0_safety_factor: float = 1.1,
     ):
         """
@@ -483,7 +494,7 @@ class AcctState:
         return self._gpv
 
     @gpv.setter
-    def gpv(self, gpv: float):
+    def gpv(self, gpv: float) -> None:
         assert gpv >= 0
         self._gpv = gpv
 
@@ -493,7 +504,7 @@ class AcctState:
         return self._ewlv
 
     @ewlv.setter
-    def ewlv(self, ewlv: float):
+    def ewlv(self, ewlv: float) -> None:
         assert 0 < ewlv <= self.gpv
         self._ewlv = ewlv
 
@@ -588,7 +599,7 @@ class OrderManager:
         self._order_state: Dict[NormedContract, OMState] = {}
         self._cooloff_time: Dict[NormedContract, float] = {}
 
-    def _check_cooloff(self, nc: NormedContract):
+    def _check_cooloff(self, nc: NormedContract) -> None:
         if (
             self._order_state.get(nc) == OMState.COOLOFF
             and time.time() - self._cooloff_time[nc] > sec.Policy.ORDER_COOLOFF

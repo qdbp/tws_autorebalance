@@ -1,7 +1,7 @@
-from numbers import Real
+from typing import Union
 
 
-def sgn(x: Real) -> int:
+def sgn(x: Union[float, int]) -> int:
     return -1 if x < 0 else 1
 
 

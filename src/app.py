@@ -10,13 +10,14 @@ from logging import getLogger, StreamHandler, Formatter, Logger, INFO
 from math import isclose
 from queue import Queue, Full
 from threading import Event, Thread
-from typing import Optional, Dict, Callable, Tuple
+from typing import Optional, Dict, Callable, Tuple, Any, TypeVar, NoReturn
 
 from colorama import Fore
 from ibapi.client import EClient
 from ibapi.common import TickerId
 from ibapi.contract import Contract
 from ibapi.order import Order
+from ibapi.order_state import OrderState
 from ibapi.wrapper import EWrapper
 
 from . import config
@@ -37,7 +38,10 @@ with open("./secrets/acct.txt") as f:
     ACCT = f.read()
 
 
-def wrapper_override(f: Callable):
+FNone = TypeVar("FNone", bound=Callable[..., None])
+
+
+def wrapper_override(f: FNone) -> FNone:
     assert hasattr(EWrapper, f.__name__)
     return f
 
@@ -51,6 +55,8 @@ class AppConfig:
     dd_coef: float
     misalloc_min_dollars: int
     misalloc_min_frac: float
+    misalloc_frac_force_elbow: float
+    misalloc_frac_force_coef: float
     min_margin_req: float
 
     # app
@@ -62,6 +68,8 @@ class AppConfig:
     def __post_init__(self) -> None:
         for field in fields(self):
             assert getattr(self, field.name) is not None
+        assert self.misalloc_frac_force_elbow > self.misalloc_min_frac > 1.0
+        assert self.misalloc_frac_force_coef > 0.0
 
     @classmethod
     def read_config(cls, cfg: ConfigParser) -> AppConfig:
@@ -82,11 +90,13 @@ class AppConfig:
             min_margin_req=Policy.MARGIN_REQ.validate(
                 strategy.getfloat("min_margin_req")
             ),
+            misalloc_frac_force_elbow=strategy.getfloat("misalloc_frac_force_elbow"),
+            misalloc_frac_force_coef=strategy.getfloat("misalloc_frac_force_coef"),
             # app
-            rebalance_freq=cfg["app"].getfloat("rebalance_freq", 60.0),
-            liveness_freq=cfg["app"].getfloat("liveness_freq", 0.1),
-            liveness_timeout=cfg["app"].getfloat("liveness_timeout", 10.0),
-            armed=cfg["app"].getboolean("armed", False),
+            rebalance_freq=cfg["app"].getfloat("rebalance_freq"),
+            liveness_freq=cfg["app"].getfloat("liveness_freq"),
+            liveness_timeout=cfg["app"].getfloat("liveness_timeout"),
+            armed=cfg["app"].getboolean("armed"),
         )
 
     def dump_config(self) -> str:
@@ -142,11 +152,11 @@ class ARBApp(EWrapper, EClient):
         self.log.info(f"Running with the following config:\n{self.conf.dump_config()}")
 
         self.liveness_event: Event = Event()
-        self.order_id_queue = Queue(maxsize=1)
+        self.order_id_queue: Queue[int] = Queue(maxsize=1)
         self.order_manager = OrderManager(log=self.log)
 
     @wrapper_override
-    def nextValidId(self, order_id: int):
+    def nextValidId(self, order_id: int) -> None:
         # this is called once on app startup.
         if not self.initialized.is_set():
             self.initialized.set()
@@ -160,11 +170,11 @@ class ARBApp(EWrapper, EClient):
     @wrapper_override
     def accountSummary(
         self, req_id: int, account: str, tag: str, value: str, currency: str
-    ):
+    ) -> None:
         self.acc_sum_acc[tag] = float(value)
 
     @wrapper_override
-    def accountSummaryEnd(self, req_id: int):
+    def accountSummaryEnd(self, req_id: int) -> None:
 
         acct_data = self.acc_sum_acc.copy()
         self.acc_sum_acc.clear()
@@ -193,7 +203,7 @@ class ARBApp(EWrapper, EClient):
     @wrapper_override
     def position(
         self, account: str, contract: Contract, position: float, avg_cost: float
-    ):
+    ) -> None:
         # TODO more graceful handling of option positions
         if contract.secType != "STK":
             return
@@ -236,13 +246,28 @@ class ARBApp(EWrapper, EClient):
 
     @wrapper_override
     def realtimeBar(
-        self, req_id: TickerId, t: int, o: float, h: float, l: float, c: float, *_,
-    ):
+        self, req_id: TickerId, t: int, o: float, h: float, l: float, c: float, *_: Any,
+    ) -> None:
         if (contract := self.price_watchers.get(req_id)) is not None:
             self.log.debug(f"Received price for {contract.symbol}: {c:.2f}")
             self.portfolio_prices[contract] = OHLCBar(t, o, h, l, c)
         else:
             self.kill_app(f"Received unsolicited price {req_id=}")
+
+    @wrapper_override
+    def openOrder(
+        self, oid: int, contract: Contract, order: Order, order_state: OrderState
+    ) -> None:
+
+        nc = self.order_manager.get_nc(oid)
+        if nc is None:
+            nc = NormedContract.normalize_contract(contract)
+            self.log.warning(
+                "Got open order for untracked instrument. "
+                "I assume this is a manual TWS order. I will track it."
+            )
+            self.order_manager.enter_order(nc, oid, order)
+            self.order_manager.transmit_order(nc)
 
     @wrapper_override
     def orderStatus(
@@ -252,18 +277,12 @@ class ARBApp(EWrapper, EClient):
         filled_qty: float,
         rem: float,
         av_fill_px: float,
-        *_,
-    ):
+        *_: Any,
+    ) -> None:
         # this assumes that for an order X, orderStatus will never be called again
         # more than COOLOFF seconds after the finalization call for X.
         nc = self.order_manager.get_nc(oid)
-        if nc is None:
-            self.log.warning(
-                "Got order status for untracked order. I assume this is a manual TWS "
-                f"order. I can't see these on my book -- be careful. ({oid=})."
-            )
-            return
-
+        assert nc is not None
         order = self.order_manager.get_order(nc)
         assert order is not None
 
@@ -286,7 +305,7 @@ class ARBApp(EWrapper, EClient):
             )
             self.reqPositions()
         else:
-            self.log.info(f"Order status for {pp_order(nc, order)}: {status}")
+            self.log.debug(f"Order status for {pp_order(nc, order)}: {status}")
 
     @property
     def pricing_complete(self) -> bool:
@@ -348,7 +367,7 @@ class ARBApp(EWrapper, EClient):
         for nc, num in self.rebalance_target.items():
             order = Order()
             order.orderType = "MIDPRICE"
-            order.transmit = False
+            order.transmit = self.conf.armed
 
             qty = abs(num)
             order.totalQuantity = Policy.ORDER_QTY.validate(qty)
@@ -361,7 +380,7 @@ class ARBApp(EWrapper, EClient):
 
         return orders
 
-    def clear_any_untransmitted_order(self, nc: NormedContract):
+    def clear_any_untransmitted_order(self, nc: NormedContract) -> None:
 
         # will do nothing if the order is anything but an untransmitted entry
         cleared_oid = self.order_manager.clear_untransmitted(nc)
@@ -393,7 +412,9 @@ class ARBApp(EWrapper, EClient):
         # ^ DO NOT REORDER THESE CALLS v
         self.placeOrder(oid, nc, order)
         self.log.info(
-            Fore.MAGENTA + f"Placed order {pp_order(nc, order)}." + Fore.RESET
+            (Fore.MAGENTA if not self.conf.armed else Fore.RED)
+            + f"Placed order {pp_order(nc, order)}."
+            + Fore.RESET
         )
 
     def safe_cancel_order(self, oid: int) -> None:
@@ -401,7 +422,7 @@ class ARBApp(EWrapper, EClient):
         # TODO this is rather weak, but without a callback...
         time.sleep(0.1)
 
-    def notify_desktop(self, msg: str):
+    def notify_desktop(self, msg: str) -> None:
         subprocess.run(
             ("notify-send", "-t", str(int(self.conf.rebalance_freq * 990)), msg)
         )
@@ -411,6 +432,9 @@ class ARBApp(EWrapper, EClient):
         while not self.workers_halt.is_set():
 
             self.wait_until_live()
+            # for mypy
+            assert self.acct_state is not None
+            assert self.portfolio is not None
 
             target_mu = self.get_target_margin_use()
             target_loan = self.acct_state.get_loan_at_target_utilization(target_mu)
@@ -436,6 +460,8 @@ class ARBApp(EWrapper, EClient):
                     target_alloc,
                     misalloc_min_dollars=self.conf.misalloc_min_dollars,
                     misalloc_min_fraction=self.conf.misalloc_min_frac,
+                    misalloc_frac_elbow=self.conf.misalloc_frac_force_elbow,
+                    misalloc_frac_coef=self.conf.misalloc_frac_force_coef,
                 ):
                     self.rebalance_target[nc] = target_alloc - cur_alloc
                 else:
@@ -449,20 +475,13 @@ class ARBApp(EWrapper, EClient):
                         max(1 - target_alloc / cur_alloc, 1 - cur_alloc / target_alloc),
                     )
 
-            self.log.info(
-                f"Target funds: ${funds / 1000:.1f}k "
-                f"(loan = ${(self.acct_state.ewlv - funds) / 1000:.1f}k), "
-                f"which uses {target_mu * 100:.2f}% of margin."
-            )
-
             ideal_fmt = ", ".join(
-                f"{sym}{'+' if delta > 0 else '-'}{abs(delta)}"
-                f"(${dollars:.0f}/{frac * 100:.1f}%)"
+                f"{sym}{delta:+}(${dollars:.0f}/{frac * 100:.2f}%)"
                 for sym, (delta, dollars, frac) in sorted(
                     ideal_allocation_delta.items(), key=lambda x: -x[1][1]
                 )
             )
-            self.log.info(f"Ideal alloc = {ideal_fmt}")
+            self.log.info(f"Ideal (mu={target_mu * 100:.2f}%) = {ideal_fmt}")
 
             if len(self.rebalance_target) > 0:
                 self.log.info(
@@ -475,8 +494,6 @@ class ARBApp(EWrapper, EClient):
                     self.safe_place_order(nc, order)
                 self.order_manager.print_book()
                 self.notify_desktop(rebalance_msg)
-            else:
-                self.log.info("Balanced.")
 
             time.sleep(self.conf.rebalance_freq)
 
@@ -501,7 +518,7 @@ class ARBApp(EWrapper, EClient):
             self.liveness_event.clear()
 
     @wrapper_override
-    def error(self, req_id: TickerId, error_code: int, error_string: str):
+    def error(self, req_id: TickerId, error_code: int, error_string: str) -> None:
         msg = f"TWS error channel: req({req_id}) ∷ {error_code} - {error_string}"
         # pacing violation
         if error_code == 420:
@@ -515,8 +532,8 @@ class ARBApp(EWrapper, EClient):
         else:
             self.kill_app(msg)
 
-    def kill_app(self, msg: str):
-        self.log.fatal(f"Killed: {msg}")
+    def kill_app(self, msg: str) -> NoReturn:
+        self.log.critical(f"Killed: {msg}")
         self.workers_halt.set()
         raise SecurityFault(msg)
 

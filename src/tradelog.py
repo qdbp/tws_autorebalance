@@ -4,13 +4,20 @@ from collections import defaultdict
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from typing import List, DefaultDict, Dict, Set
+from typing import List, DefaultDict, Dict, Set, Any
 
+import matplotlib
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+from matplotlib.axes import Axes
 
 from src import config
-from src.model.data import Trade, Position
+from src.model.calc import calculate_profit_attributions
+from src.model.data import Trade, AttributionSet, Portfolio
+
+plt.style.use("ggplot")
+matplotlib.rc("figure", figsize=(12, 8))
 
 
 def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
@@ -47,14 +54,17 @@ def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
         # if qty < 0, we lower price; else we increase.
         price -= comm / qty
 
-        out[symbol].add(Trade(symbol, t, qty, price))
+        try:
+            out[symbol].add(Trade(symbol, t, qty, price))
+        except AssertionError:
+            print("xxx")
 
     return out
 
 
 def load_trade_logs() -> Dict[str, List[Trade]]:
     trade_dir = Path(config()["trade_log"]["log_dir"]).expanduser()
-    all_trades = defaultdict(set)
+    all_trades: DefaultDict[str, Set[Trade]] = defaultdict(set)
     for fn in trade_dir.glob("*.csv"):
         fn_log = parse_tws_trade_log(fn)
         for sym, trades in fn_log.items():
@@ -62,49 +72,83 @@ def load_trade_logs() -> Dict[str, List[Trade]]:
     return {sym: sorted(trades) for sym, trades in all_trades.items()}
 
 
-if __name__ == "__main__":
+def plot_trade_attributions(
+    start: datetime, end: datetime, go_backwards: bool = True, **plot_kwargs: Any
+) -> None:
 
-    import numpy as np
-
-    np.set_printoptions(precision=2)
-
-    end = datetime(2021, 5, 1)
-    start = datetime(2018, 3, 15)
-
-    trade_logs = load_trade_logs()
-    open_positions: Dict[str, Position] = {
-        sym: Position.empty(sym) for sym in trade_logs.keys()
+    attrs = {
+        sym: calculate_profit_attributions(
+            trades, start=start, end=end, go_backwards=go_backwards
+        )[0]
+        for sym, trades in load_trade_logs().items()
+    }
+    opens = {
+        sym: calculate_profit_attributions(
+            trades, start=start, end=end, go_backwards=go_backwards
+        )[1]
+        for sym, trades in load_trade_logs().items()
     }
 
-    credit_logs = defaultdict(dict)
-    basis_logs = defaultdict(dict)
-    av_cost_logs = defaultdict(dict)
-    nlv_logs = defaultdict(dict)
+    attr_set = AttributionSet(pa for pas in attrs.values() for pa in pas)
+    net_daily = attr_set.net_daily_attr
 
-    for sym, trades in trade_logs.items():
-        for t in trades:
-            if t.time < start:
-                continue
-            open_positions[sym] = (new_pos := open_positions[sym].transact(t))
+    dates, dailies = zip(*list(net_daily.items()))
 
-            credit_logs[sym][t.time] = new_pos.credit
-            basis_logs[sym][t.time] = new_pos.basis
-            nlv_logs[sym][t.time] = new_pos.book_nlv
+    ax1: Axes
+    fig, (ax1, ax2) = plt.subplots(2, 1)
 
-            if new_pos.qty != 0:
-                av_cost_logs[sym][t.time] = new_pos.av_price
+    ax1.plot(dates, dailies, label="Daily profits", **plot_kwargs)
+    ax1.set_xticklabels([])
+    ax2.plot(
+        dates, np.cumsum(dailies), label="Cumulative profits", color="k", **plot_kwargs
+    )
 
-    ax2 = None
-    for sym, log in sorted(av_cost_logs.items()):
-        pos = open_positions[sym]
-        if pos.qty == 0:
-            continue
-        times, basis = list(zip(*log.items()))
-        basis = np.array(basis)
-        basis = (basis - basis[0]) / basis[0]
-        plt.plot(times, basis, label=sym)
 
-    plt.xlim(datetime(2020, 2, 1), datetime(2020, 4, 8))
-    plt.gca().grid()
+def analyze_trades() -> None:
+
+    from argparse import ArgumentParser
+
+    parser = ArgumentParser()
+    parser.add_argument(
+        "--start",
+        default="1900-01-01",
+        type=datetime.fromisoformat,
+        help="start date for trade attribution analysis",
+    )
+    parser.add_argument(
+        "--end",
+        default="2100-01-01",
+        type=datetime.fromisoformat,
+        help="end date for trade attribution analysis",
+    )
+    parser.add_argument(
+        "--backwards",
+        action="store_true",
+        default=False,
+        help="walk trades backwards (newer trade is open)",
+    )
+
+    args = parser.parse_args()
+
+    plot_trade_attributions(args.start, args.end, go_backwards=args.backwards)
+
     plt.legend()
     plt.show()
+
+    all_trades = load_trade_logs()
+    port = Portfolio()
+    for trades in all_trades.values():
+        for t in trades:
+            if not args.end >= t.time >= args.start:
+                continue
+            port.transact(t)
+
+    for pos in sorted(port.positions.values(), key=lambda x: -x.book_nlv):
+        if abs(pos.book_nlv) < 50:
+            continue
+        print(pos, f"{pos.book_nlv:.2f}$")
+    print(port.book_nlv)
+
+
+if __name__ == "__main__":
+    analyze_trades()

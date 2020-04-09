@@ -16,9 +16,8 @@ import sys
 from abc import abstractmethod
 from dataclasses import dataclass
 from logging import getLogger, INFO, StreamHandler, Formatter, Logger
-from numbers import Number
 from types import MappingProxyType
-from typing import TypeVar, Generic, Callable
+from typing import TypeVar, Generic, Callable, Union
 
 from colorama import Fore, init as init_colorama
 from ibapi.order import Order
@@ -76,7 +75,7 @@ class ThreeTierGeneric(Generic[T]):
     confirm_level: T
     notify_level: T
     confirm_msg: str
-    cmp_op: Callable[[T, T], bool] = None
+    cmp_op: Callable[[T, T], bool]
 
     def __post_init__(self) -> None:
         assert self.cmp_op is not None
@@ -126,47 +125,51 @@ class ThreeTierGeneric(Generic[T]):
         """
 
 
+Number = Union[int, float]
+N = TypeVar("N", bound=Number)
+
+
 @dataclass(frozen=True)
-class ThreeTierNMax(ThreeTierGeneric[Number]):
+class ThreeTierNMax(ThreeTierGeneric[N]):
     """
     Two-tier confirm/block security policy for numbers that should not exceed some
     maximum.
     """
 
-    cmp_op: Callable[[Number, Number], bool] = operator.gt
+    cmp_op: Callable[[N, N], bool] = operator.gt
 
     def __post_init__(self) -> None:
         super().__post_init__()
         assert self.block_level > self.confirm_level
 
-    def fmt_val(self, val: T) -> str:
+    def fmt_val(self, val: N) -> str:
         if isinstance(val, float):
             return f"{val:.3f}"
         else:
-            return f"{val:0d}"
+            return f"{val:0d}"  # type: ignore
 
     def fmt_op(self) -> str:
         return ">"
 
 
 @dataclass(frozen=True)
-class ThreeTierNMin(ThreeTierGeneric[Number]):
+class ThreeTierNMin(ThreeTierGeneric[N]):
     """
     Two-tier confirm/block security policy for numbers that should not go under some
     minimum.
     """
 
-    cmp_op: Callable[[Number, Number], bool] = operator.lt
+    cmp_op: Callable[[N, N], bool] = operator.lt
 
     def __post_init__(self) -> None:
         super().__post_init__()
         assert self.block_level < self.confirm_level
 
-    def fmt_val(self, val: T) -> str:
+    def fmt_val(self, val: N) -> str:
         if isinstance(val, float):
             return f"{val:.3f}"
         else:
-            return f"{val:0d}"
+            return f"{val:0d}"  # type: ignore
 
     def fmt_op(self) -> str:
         return "<"
@@ -182,12 +185,16 @@ class Policy:
     MARGIN_REQ = ThreeTierNMin(
         "MARGIN REQ", 0.15, 0.20, 0.25, "Low margin requirement."
     )
-    LOAN_AMT = ThreeTierNMax("LOAN AMOUNT", 100_000, 75_000, 50_000, "Large loan size.")
+    LOAN_AMT = ThreeTierNMax(
+        "LOAN AMOUNT", 100_000.0, 75_000.0, 50_000.0, "Large loan size."
+    )
     MISALLOCATION = ThreeTierNMax(
         "MISALLOCATION", 3e-3, 1e-3, 3e-4, "Misallocated portfolio."
     )
     ORDER_QTY = ThreeTierNMax("ORDER SIZE", 250, 100, 50, "Large order size.")
-    ORDER_TOTAL = ThreeTierNMax("ORDER TOTAL", 10000, 2500, 1000, "Large order amount.")
+    ORDER_TOTAL = ThreeTierNMax(
+        "ORDER TOTAL", 10000.0, 2500.0, 1000.0, "Large order amount."
+    )
     MISALLOC_DOLLARS = ThreeTierNMin(
         "MISALLOC $ MIN", 200, 400, 600, "Small dollar rebalance threshold."
     )
