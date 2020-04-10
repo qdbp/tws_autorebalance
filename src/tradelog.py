@@ -38,7 +38,7 @@ def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
         elif line.startswith(data_prefix):
             data_lines.append(line[len(data_prefix) :])
 
-    df = pd.read_csv(StringIO("\n".join(data_lines)), thousands=",")
+    df = pd.read_csv(StringIO("\n".join(data_lines)), thousands=",", header=None)
     df.columns = columns
     df = df[["Date/Time", "Symbol", "Quantity", "T. Price", "Comm/Fee"]]
     df["Date/Time"] = pd.to_datetime(df["Date/Time"])
