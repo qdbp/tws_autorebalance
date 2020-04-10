@@ -21,7 +21,7 @@ from matplotlib.ticker import FixedLocator, MultipleLocator, FuncFormatter
 
 from src import finsec as sec
 from src.model.math import sgn
-from src.model.util import pp_order
+from src.model.util import pp_order, fmt_dollars
 
 
 @dataclass(frozen=True, order=True)
@@ -120,9 +120,9 @@ class Position:
 
     def __str__(self) -> str:
         return (
-            f"Position[{self.sym:<4s} x {self.qty: 4d} "
-            f"@ {self.av_price:7.3f} ${'(' if self.credit < 0 else ' '}"
-            f"{abs(self.credit):6,.0f}{')' if self.credit < 0 else ' '}]"
+            f"Position[{self.qty: >5d} {self.sym:<4s} at "
+            f"{self.av_price: >6.2f} and {fmt_dollars(self.credit)} cash"
+            f" -> {fmt_dollars(self.book_nlv)} book]"
         )
 
 
