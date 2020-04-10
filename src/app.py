@@ -279,8 +279,7 @@ class ARBApp(EWrapper, EClient):
         av_fill_px: float,
         *_: Any,
     ) -> None:
-        # this assumes that for an order X, orderStatus will never be called again
-        # more than COOLOFF seconds after the finalization call for X.
+
         nc = self.order_manager.get_nc(oid)
         assert nc is not None
         order = self.order_manager.get_order(nc)
