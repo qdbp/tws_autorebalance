@@ -53,11 +53,7 @@ def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
         t = date.to_pydatetime()
         # if qty < 0, we lower price; else we increase.
         price -= comm / qty
-
-        try:
-            out[symbol].add(Trade(symbol, t, qty, price))
-        except AssertionError:
-            print("xxx")
+        out[symbol].add(Trade(symbol, t, qty, price))
 
     return out
 
