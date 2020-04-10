@@ -22,9 +22,9 @@ from typing import TypeVar, Generic, Callable, Union
 from colorama import Fore, init as init_colorama
 from ibapi.order import Order
 
-# the poor man's frozendict
 from src import config
 
+# the poor man's frozendict
 PERMIT_ERROR = MappingProxyType(
     {
         504: "DEBUG",  # not connected -- always thrown on start

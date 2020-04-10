@@ -82,12 +82,6 @@ def plot_trade_attributions(
         )[0]
         for sym, trades in load_trade_logs().items()
     }
-    opens = {
-        sym: calculate_profit_attributions(
-            trades, start=start, end=end, go_backwards=go_backwards
-        )[1]
-        for sym, trades in load_trade_logs().items()
-    }
 
     attr_set = AttributionSet(pa for pas in attrs.values() for pa in pas)
     net_daily = attr_set.net_daily_attr
@@ -144,9 +138,7 @@ def analyze_trades() -> None:
             port.transact(t)
 
     for pos in sorted(port.positions.values(), key=lambda x: -x.book_nlv):
-        if abs(pos.book_nlv) < 50:
-            continue
-        print(pos, f"{pos.book_nlv:.2f}$")
+        print(pos)
     print(port.book_nlv)
 
 
