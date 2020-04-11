@@ -1,15 +1,17 @@
 from dataclasses import replace
-from datetime import datetime
-from typing import Dict, List, Tuple
+from functools import lru_cache
+from itertools import product
+from typing import Dict, List, Tuple, Literal, Optional
 
 import numpy as np
 import pulp
 from ibapi.contract import Contract
+from pulp import LpInteger, LpProblem, LpMinimize, COIN, LpStatus
 from pulp_lparray import lparray
 
 from src import finsec as sec
-from src.model.data import Composition, Trade, ProfitAttribution
-from src.model.math import shrink, sgn
+from src.model.data import Composition, Trade, ProfitAttribution, Position
+from src.model.math import shrink
 
 
 def find_closest_portfolio(
@@ -101,99 +103,129 @@ def check_if_needs_rebalance(
     return large_enough_trade and sufficiently_misallocated
 
 
+PAttrMode = Literal["max_loss", "max_gain", "min_variation", "longest", "shortest"]
+
+
+@lru_cache()
 def calculate_profit_attributions(
-    trades: List[Trade],
-    start: datetime = None,
-    end: datetime = None,
-    go_backwards: bool = False,
-) -> Tuple[List[ProfitAttribution], int]:
+    trades: Tuple[Trade], mode: PAttrMode = "min_variation",
+) -> Tuple[List[ProfitAttribution], Optional[Position]]:
+
     """
     Convert a list of trades into ProfitAttributions, matching opposite-side trades
     in a LIFO fashion. Returns this list and the net unmatched position.
 
-    First, a stack S of "unmatched" trades is initialized.
-    Going through the trades from earliest to latest, if the current trade t matches
-    the sign of the top of S, or if S is empty, t is added to the stack. Otherwise
-    the trades (partially) cancel, and a profit attribution is created from the
-    difference. If top(S) is only partially cancelled, the remainder is returned to
-    the top of the stack. If t is only partially cancelled, the process continues with
-    the remainder t' until it is either cancelled or added to the stack, at which point
-    the next trade from the list of unprocessed trades is drawn. This continues until
-    all trades have been processed.
+    Uses a MILP solver to assign opening trades to closing trades according to a
+    preferred criterion, given as `mode`. The modes are:
 
-    If go_backwards is true, the list of trades is iterated from most recent to oldest
-    instead.
+        max_loss: attempt to maximize losses by matching lowest sells with highest
+            buys. Note that this can be acausal, e.g. a sale can be matched
+            with a later buy even when you are long the instrument at the time it is
+            made.
+        max_gain: the opposite of max_loss, same caveat.
+        min_variation: attempt to minimize total variation in realized gains.
+        longest: maximizes the total time between opening and closing trades.
+        shortes: minimizes the total time between opening and closing trades.
 
     Args:
-        trades: the trades to match into ProfitAttributions.
-        start: only trades from this time onward will be considered.
-        end: only trades through this point will be considered.
-        go_backwards: if True, trades will be processed in reverse order
+        mode: the mode, as described above.
 
     Returns:
-        the list of generated ProfitAttributions, and the net open position.
+        a tuple of:
+            the list of ProfitAttributions generated according to the mode,
+            the residual Position composed of unmatched trades.
     """
 
-    trades = [
-        tr
-        for tr in trades
-        if (start is None or tr.time >= start) and (end is None or tr.time <= end)
-    ]
+    if not trades:
+        return [], None
 
-    if len(trades) < 2:
-        return [], 0
+    buys = sorted([t for t in trades if t.qty > 0], key=lambda x: x.price)
+    sells = sorted([t for t in trades if t.qty < 0], key=lambda x: x.price)
 
-    sym = trades[0].sym
+    nb = len(buys)
+    ns = len(sells)
 
-    open_positions: List[Trade] = []
-    profit_attr: List[ProfitAttribution] = []
+    if min(nb, ns) == 0:
+        return [], Position.from_trades(trades)
 
-    for close_tr in sorted(trades)[:: -1 if go_backwards else 1]:
+    price_arr = np.zeros((nb, ns))
 
-        # this is an invariant that should be maintained by the attribution algorithm.
-        assert all(p.qty < 0 for p in open_positions) or all(
-            p.qty > 0 for p in open_positions
-        ), str([str(op) for op in open_positions])
-        # to check we have a consistent history
-        assert close_tr.sym == sym
-        assert close_tr.qty != 0
+    # for many of these modes there are probably bespoke algorithms with more finesse...
+    # ... but the sledgehammer is more fun than the scalpel.
+    for bx, sx in product(range(nb), range(ns)):
+        buy = buys[bx]
+        sell = sells[sx]
+        if mode == "max_loss":
+            price_arr[bx, sx] = sell.price - buy.price
+        elif mode == "max_gain":
+            price_arr[bx, sx] = buy.price - sell.price
+        elif mode == "min_variation":
+            price_arr[bx, sx] = abs(buy.price - sell.price)
+        elif mode == "longest":
+            start = min(buy.time, sell.time)
+            end = max(buy.time, sell.time)
+            price_arr[bx, sx] = (start - end).total_seconds() / 86400
+        elif mode == "shortest":
+            start = min(buy.time, sell.time)
+            end = max(buy.time, sell.time)
+            price_arr[bx, sx] = (end - start).total_seconds() / 86400
+        else:
+            raise ValueError()
 
-        while open_positions:
-            open_tr = open_positions.pop()
-            if go_backwards:
-                assert open_tr.time > close_tr.time
-            else:
-                assert open_tr.time < close_tr.time
+    # we ensure that we always decrease our loss by making any assignment to guarantee
+    # that all min(nb, ns) possible shares are matched.
+    price_arr -= price_arr.max() + 1.0
 
-            # close_tr doesn't close anything and is added to the position.
-            if sgn(open_tr.qty) == sgn(close_tr.qty):
-                open_positions.append(open_tr)
-                open_positions.append(close_tr)
-                break  # get new trade
+    sell_qty_limit = np.array([-t.qty for t in sells], dtype=np.uint32)
+    buy_qty_limit = np.array([t.qty for t in buys], dtype=np.uint32)
 
-            # (some of) the query trade closes (some of) the latest position
-            qo, qc = abs(open_tr.qty), abs(close_tr.qty)
-            to, tc = open_tr.time, close_tr.time
+    prob = LpProblem(sense=LpMinimize)
 
-            sell_px = open_tr.price if open_tr.qty < 0 else close_tr.price
-            buy_px = open_tr.price if open_tr.qty > 0 else close_tr.price
-            net_gain = (sell_px - buy_px) * min(qo, qc)
+    match: lparray = lparray.create_anon("Match", (nb, ns), cat=LpInteger, lowBound=0)
 
-            profit_attr.append(ProfitAttribution(sym, to, tc, min(qo, qc), net_gain))
+    (match.sum(axis=0) <= sell_qty_limit).constrain(prob, "SellLimit")
+    (match.sum(axis=1) <= buy_qty_limit).constrain(prob, "BuyLimit")
 
-            # remove open; shrink close, check against next open, if any
-            if qo < qc:
-                close_tr = replace(close_tr, qty=shrink(close_tr.qty, qo))
-                continue
-            # shrink open and remove close; get next close from list
-            if qo > qc:
-                abated_open_tr = replace(open_tr, qty=shrink(open_tr.qty, qc))
-                open_positions.append(abated_open_tr)
-            break
+    cost = (match * price_arr).sumit()
+    prob += cost
 
-        # the current open positions list is empty -- the remainder of the query is
-        # added as an open position
-        else:  # not open_positions
-            open_positions.append(close_tr)
+    COIN().solve(prob)
+    solution = match.values
 
-    return profit_attr, sum(t.qty for t in open_positions)
+    assert LpStatus[prob.status] == "Optimal"
+    # double-check that no possible trades have been withheld
+    assert solution.sum() == min(sell_qty_limit.sum(), buy_qty_limit.sum())
+
+    pas = []
+    for bx, sx in zip(*np.nonzero(solution)):
+        buy = buys[bx]
+        sell = sells[sx]
+        assert buy.sym == sell.sym
+        pas.append(
+            ProfitAttribution(
+                sym=buy.sym,
+                start_time=min(buy.time, sell.time),
+                end_time=max(buy.time, sell.time),
+                qty=int(solution[bx, sx]),
+                net_gain=solution[bx, sx] * (sell.price - buy.price),
+            )
+        )
+
+    residual_trades = []
+    if nb < ns:
+        for sx in range(ns):
+            unmatched = int(shrink(sells[sx].qty, solution[:, sx].sum()))
+            if unmatched < 0:
+                residual_trades.append(replace(sells[sx], qty=unmatched))
+    elif ns < nb:
+        for bx in range(nb):
+            unmatched = int(shrink(buys[bx].qty, solution[bx, :].sum()))
+            if unmatched > 0:
+                residual_trades.append(replace(buys[bx], qty=unmatched))
+
+    if residual_trades:
+        pos = Position.from_trades(residual_trades)
+    else:
+        pos = Position.empty(trades[0].sym)
+
+    return pas, pos

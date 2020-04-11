@@ -8,7 +8,7 @@ from enum import Enum, auto
 from functools import total_ordering
 from logging import Logger
 from math import isclose
-from typing import Tuple, Dict, Optional, Iterable, List, Set
+from typing import Tuple, Dict, Optional, Iterable, List, Set, Literal
 
 import numpy as np
 from cycler import cycler
@@ -21,7 +21,7 @@ from matplotlib.ticker import FixedLocator, MultipleLocator, FuncFormatter
 
 from src import finsec as sec
 from src.model.math import sgn
-from src.model.util import pp_order, fmt_dollars
+from src.model.util import pp_order, fmt_dollars, assert_type
 
 
 @dataclass(frozen=True, order=True)
@@ -45,6 +45,7 @@ class Trade:
 
     def __post_init__(self) -> None:
         assert self.price >= 0
+        assert isinstance(self.qty, int)
         assert abs(self.qty) > 0
 
     def __str__(self) -> str:
@@ -82,6 +83,15 @@ class Position:
     def empty(cls, sym: str) -> Position:
         return Position(sym, 0.0, 0, 0.0)
 
+    @classmethod
+    def from_trades(cls, trades: List[Trade]) -> Position:
+        assert trades
+        trades = sorted(trades)
+        p = cls.empty(sym=trades[0].sym)
+        for t in trades:
+            p = p.transact(t)
+        return p
+
     def transact(self, trade: Trade) -> Position:
         assert trade.sym == self.sym
 
@@ -118,6 +128,15 @@ class Position:
         """
         return self.credit + self.qty * self.av_price
 
+    def mtm(self, method: Literal["yf"] = "yf") -> float:
+        if method == "yf":
+            import yfinance as yf
+
+            out: float = self.qty * yf.Ticker(self.sym).info["regularMarketPrice"]
+            return out
+
+        raise NotImplemented(f"Unknown method {method}")
+
     def __str__(self) -> str:
         return (
             f"Position[{self.qty: >5d} {self.sym:<4s} at "
@@ -131,6 +150,7 @@ class Portfolio:
         self.positions: Dict[str, Position] = {}
 
     def transact(self, trade: Trade) -> None:
+        assert_type(trade, Trade)
         self.positions[trade.sym] = self.positions.get(
             trade.sym, Position.empty(trade.sym)
         ).transact(trade)
@@ -143,13 +163,25 @@ class Portfolio:
     def credit(self) -> float:
         return sum(pos.credit for pos in self.positions.values())
 
+    @property
+    def basis(self) -> float:
+        return sum(pos.basis for pos in self.positions.values())
+
+    def __str__(self) -> str:
+        return (
+            f"Portfolio[{{{','.join(self.positions.keys())}}} "
+            f"{fmt_dollars(self.basis, width=0)} basis + "
+            f"{fmt_dollars(self.credit, width=0)} cash = "
+            f"{fmt_dollars(self.book_nlv, width=0)} book]"
+        )
+
 
 @dataclass(frozen=True, order=True)
 class ProfitAttribution:
 
-    __slots__ = ("symbol", "start_time", "end_time", "qty", "net_gain")
+    __slots__ = ("sym", "start_time", "end_time", "qty", "net_gain")
 
-    symbol: str
+    sym: str
     start_time: datetime
     end_time: datetime
     qty: int
@@ -178,7 +210,7 @@ class ProfitAttribution:
 
     def __str__(self) -> str:
         return (
-            f"ProfitAttr({self.symbol} x {self.qty}: {self.net_gain:.2f} for "
+            f"ProfitAttr({self.sym} x {self.qty}: {self.net_gain:.2f} for "
             f"[{self.start_time}, {self.end_time}]"
         )
 
@@ -195,7 +227,7 @@ class AttributionSet:
 
     def get_total_for(self, symbol: str) -> Optional[ProfitAttribution]:
 
-        sym_pas = sorted(pa for pa in self.pas if pa.symbol == symbol)
+        sym_pas = sorted(pa for pa in self.pas if pa.sym == symbol)
         if not sym_pas:
             return None
 
@@ -234,7 +266,7 @@ class AttributionSet:
 
     @property
     def all_symbols(self) -> Set[str]:
-        return {pa.symbol for pa in self.pas}
+        return {pa.sym for pa in self.pas}
 
     @property
     def pas_by_start(self) -> List[ProfitAttribution]:
@@ -269,7 +301,7 @@ class AttributionSet:
         have_labelled = set()
 
         for pa in self.pas:
-            sym = pa.symbol
+            sym = pa.sym
             if sym not in include_symbols:
                 continue
 
@@ -283,7 +315,7 @@ class AttributionSet:
                 [pa.start_time, pa.end_time],
                 [pl := (sgn(pa.net_gain) * np.log10(abs(pa.net_gain))), pl],
                 **styles[ixes[sym]],
-                label=label
+                label=label,
             )
 
         ax.legend()
