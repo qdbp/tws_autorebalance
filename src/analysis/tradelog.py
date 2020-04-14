@@ -21,7 +21,7 @@ from src import config
 from src.model.calc import calculate_profit_attributions, PAttrMode
 from src.model.data import Trade, AttributionSet, Portfolio
 
-matplotlib.rc("figure", figsize=(12, 8))
+matplotlib.rc("figure", figsize=(12, 12))
 
 
 def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
@@ -42,12 +42,15 @@ def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
         elif line.startswith(data_prefix):
             data_lines.append(line[len(data_prefix) :])
 
+    out: DefaultDict[str, Set[Trade]] = defaultdict(set)
+
+    if not data_lines:
+        return out
+
     df = pd.read_csv(StringIO("\n".join(data_lines)), thousands=",", header=None)
     df.columns = columns
     df = df[["Date/Time", "Symbol", "Quantity", "T. Price", "Comm/Fee"]]
     df["Date/Time"] = pd.to_datetime(df["Date/Time"])
-
-    out = defaultdict(set)
 
     for date, symbol, qty, price, comm in df.itertuples(index=False):
 
@@ -62,13 +65,20 @@ def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
     return out
 
 
-def load_trade_logs(start: datetime, end: datetime) -> Dict[str, List[Trade]]:
+def load_trade_logs(
+    start: datetime = None, end: datetime = None
+) -> Dict[str, List[Trade]]:
     trade_dir = Path(config()["trade_log"]["log_dir"]).expanduser()
     all_trades: DefaultDict[str, Set[Trade]] = defaultdict(set)
     for fn in trade_dir.glob("*.csv"):
         fn_log = parse_tws_trade_log(fn)
         for sym, trades in fn_log.items():
-            all_trades[sym] |= {tr for tr in trades if start <= tr.time <= end}
+            all_trades[sym] |= {
+                tr
+                for tr in trades
+                if (start is None or start <= tr.time)
+                and (end is None or end >= tr.time)
+            }
     return {sym: sorted(trades) for sym, trades in all_trades.items() if trades}
 
 
@@ -91,6 +101,8 @@ def get_args() -> Namespace:
 
     args = parser.parse_args()
     args.end = min(args.end, datetime.now())
+
+    assert args.end >= args.start
 
     return args
 
@@ -135,37 +147,42 @@ def plot_trade_profits(
 
 
 def analyze_trades(
+    start: datetime,
+    end: datetime,
+    *,
     mode: PAttrMode = "min_variation",
     ylim1: Tuple[int, int] = (-100, 300),
     ylim2: Tuple[int, int] = (-2000, 4000),
 ) -> None:
-    args = get_args()
 
-    delta = timedelta(days=1)
-    end = args.start + delta
 
-    all_trades = load_trade_logs(args.start, args.end)
+    all_trades = load_trade_logs(start, end)
     portfolio = Portfolio()
     for ts in all_trades.values():
         for t in ts:
             portfolio.transact(t)
 
-    non_zero_syms = {pos.sym for pos in portfolio.positions.values() if pos.qty != 0}
+    non_zero_syms = {pos.sym for pos in portfolio.positions if pos.qty != 0}
 
     all_dates = []
     tot_cash = []
     tot_basis = []
     weighted_av_price = []
 
-    while end <= args.end:
+    print(start, end)
 
-        all_dates.append(end)
+    delta = timedelta(days=1)
+    cur_date = start + delta
+
+    while cur_date <= end:
+
+        all_dates.append(cur_date)
         tot_cash.append(0.0)
         tot_basis.append(0.0)
 
         attributed = {
             sym: calculate_profit_attributions(
-                tuple(t for t in trades if t.time <= end), mode=mode
+                tuple(t for t in trades if t.time <= cur_date), mode=mode
             )
             for sym, trades in all_trades.items()
             if sym in non_zero_syms
@@ -198,7 +215,7 @@ def analyze_trades(
         else:
             weighted_av_price.append(0.0)
 
-        end += delta
+        cur_date += delta
 
     fig, ax1, ax2 = plot_trade_profits(attr_set)
     ax1.plot(
@@ -215,14 +232,30 @@ def analyze_trades(
         label="cumulative profit (marching)",
     )
     ax2.legend()
-    ax1.set_title(
-        f"Profits from {args.start.date()} to {args.end.date()}, method='{mode}'"
-    )
+    ax1.set_title(f"Profits from {start.date()} to {cur_date.date()}, method='{mode}'")
+    ax1.legend()
     ax1.set_ylim(ylim1)
+    ax1.set_xlim(ax2.get_xlim())
     ax2.set_ylim(ylim2)
     fig.show()
 
 
+def summarize_closed_positions() -> None:
+
+    all_trades = load_trade_logs()
+    base_port = Portfolio.from_trade_dict(all_trades)
+    portfolio = base_port.filter(lambda pos: pos.basis == 0.0)
+
+    print("Closed positions:")
+    for pos in sorted(portfolio.positions, key=lambda x: x.book_nlv):
+        print(pos)
+
+    print("")
+    print("Effective portfolio:")
+    print(portfolio)
+
+
 if __name__ == "__main__":
-    analyze_trades("min_variation")
-    analyze_trades("shortest")
+    args = get_args()
+    analyze_trades(args.start, args.end, mode="min_variation")
+    summarize_closed_positions()

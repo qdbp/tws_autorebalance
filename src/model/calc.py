@@ -9,7 +9,7 @@ from ibapi.contract import Contract
 from pulp import LpInteger, LpProblem, LpMinimize, COIN, LpStatus
 from pulp_lparray import lparray
 
-from src import finsec as sec
+from src import security as sec
 from src.model.data import Composition, Trade, ProfitAttribution, Position
 from src.model.math import shrink
 
@@ -136,7 +136,7 @@ def calculate_profit_attributions(
             the residual Position composed of unmatched trades.
     """
 
-    if not trades:
+    if len(trades) == 0:
         return [], None
 
     buys = sorted([t for t in trades if t.qty > 0], key=lambda x: x.price)
@@ -146,9 +146,9 @@ def calculate_profit_attributions(
     ns = len(sells)
 
     if min(nb, ns) == 0:
-        return [], Position.from_trades(trades)
+        return [], Position.from_trades(list(trades))
 
-    price_arr = np.zeros((nb, ns))
+    loss = np.zeros((nb, ns))
 
     # for many of these modes there are probably bespoke algorithms with more finesse...
     # ... but the sledgehammer is more fun than the scalpel.
@@ -156,25 +156,25 @@ def calculate_profit_attributions(
         buy = buys[bx]
         sell = sells[sx]
         if mode == "max_loss":
-            price_arr[bx, sx] = sell.price - buy.price
+            loss[bx, sx] = sell.price - buy.price
         elif mode == "max_gain":
-            price_arr[bx, sx] = buy.price - sell.price
+            loss[bx, sx] = buy.price - sell.price
         elif mode == "min_variation":
-            price_arr[bx, sx] = abs(buy.price - sell.price)
+            loss[bx, sx] = abs(buy.price - sell.price)
         elif mode == "longest":
             start = min(buy.time, sell.time)
             end = max(buy.time, sell.time)
-            price_arr[bx, sx] = (start - end).total_seconds() / 86400
+            loss[bx, sx] = (start - end).total_seconds() / 86400
         elif mode == "shortest":
             start = min(buy.time, sell.time)
             end = max(buy.time, sell.time)
-            price_arr[bx, sx] = (end - start).total_seconds() / 86400
+            loss[bx, sx] = (end - start).total_seconds() / 86400
         else:
             raise ValueError()
 
     # we ensure that we always decrease our loss by making any assignment to guarantee
     # that all min(nb, ns) possible shares are matched.
-    price_arr -= price_arr.max() + 1.0
+    loss -= loss.max() + 1.0
 
     sell_qty_limit = np.array([-t.qty for t in sells], dtype=np.uint32)
     buy_qty_limit = np.array([t.qty for t in buys], dtype=np.uint32)
@@ -186,7 +186,7 @@ def calculate_profit_attributions(
     (match.sum(axis=0) <= sell_qty_limit).constrain(prob, "SellLimit")
     (match.sum(axis=1) <= buy_qty_limit).constrain(prob, "BuyLimit")
 
-    cost = (match * price_arr).sumit()
+    cost = (match * loss).sumit()
     prob += cost
 
     COIN().solve(prob)

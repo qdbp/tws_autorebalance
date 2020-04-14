@@ -20,10 +20,9 @@ from ibapi.order import Order
 from ibapi.order_state import OrderState
 from ibapi.wrapper import EWrapper
 
-from . import config
-from .finsec import SecurityFault, PERMIT_ERROR, Policy, audit_order
-from .model.calc import find_closest_portfolio, check_if_needs_rebalance
-from .model.data import (
+from src import config
+from src.model.calc import find_closest_portfolio, check_if_needs_rebalance
+from src.model.data import (
     OHLCBar,
     Trade,
     NormedContract,
@@ -32,7 +31,8 @@ from .model.data import (
     OMState,
     OrderManager,
 )
-from .model.util import pp_order
+from src.model.util import pp_order
+from src.security import SecurityFault, PERMIT_ERROR, Policy, audit_order
 
 with open("./secrets/acct.txt") as f:
     ACCT = f.read()

@@ -8,7 +8,19 @@ from enum import Enum, auto
 from functools import total_ordering
 from logging import Logger
 from math import isclose
-from typing import Tuple, Dict, Optional, Iterable, List, Set, Literal
+from typing import (
+    Tuple,
+    Dict,
+    Optional,
+    Iterable,
+    List,
+    Set,
+    Literal,
+    Callable,
+    ItemsView,
+    KeysView,
+    ValuesView,
+)
 
 import numpy as np
 from cycler import cycler
@@ -19,7 +31,7 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.ticker import FixedLocator, MultipleLocator, FuncFormatter
 
-from src import finsec as sec
+from src import security as sec
 from src.model.math import sgn
 from src.model.util import pp_order, fmt_dollars, assert_type
 
@@ -146,30 +158,73 @@ class Position:
 
 
 class Portfolio:
+    """
+    This class is a wrapper around a dictionary mapping symbols to Positions of that
+    symbol.
+
+    """
+
     def __init__(self) -> None:
-        self.positions: Dict[str, Position] = {}
+        self._positions: Dict[str, Position] = {}
+
+    @classmethod
+    def from_trade_dict(cls, trade_dict: Dict[str, List[Trade]]) -> Portfolio:
+        port = cls()
+        for sym, trades in trade_dict.items():
+            port[sym] = Position.from_trades(trades)
+        return port
 
     def transact(self, trade: Trade) -> None:
         assert_type(trade, Trade)
-        self.positions[trade.sym] = self.positions.get(
+        self[trade.sym] = self._positions.get(
             trade.sym, Position.empty(trade.sym)
         ).transact(trade)
 
+    def filter(self, func: Callable[[Position], bool]) -> Portfolio:
+        out = Portfolio()
+        for sym, pos in self.items:
+            if func(pos):
+                out[sym] = pos
+        return out
+
     @property
     def book_nlv(self) -> float:
-        return sum(pos.book_nlv for pos in self.positions.values())
+        return sum(pos.book_nlv for pos in self._positions.values())
 
     @property
     def credit(self) -> float:
-        return sum(pos.credit for pos in self.positions.values())
+        return sum(pos.credit for pos in self._positions.values())
 
     @property
     def basis(self) -> float:
-        return sum(pos.basis for pos in self.positions.values())
+        return sum(pos.basis for pos in self._positions.values())
+
+    def __getitem__(self, sym: str) -> Position:
+        return self._positions[sym]
+
+    def __setitem__(self, sym: str, position: Position) -> None:
+        assert position.sym == sym
+        self._positions[sym] = position
+
+    @property
+    def items(self) -> ItemsView[str, Position]:
+        return self._positions.items()
+
+    @property
+    def positions(self) -> ValuesView[Position]:
+        return self._positions.values()
+
+    @property
+    def symbols(self) -> KeysView[str]:
+        return self._positions.keys()
 
     def __str__(self) -> str:
+        if (ns := len(self.symbols)) < 10:
+            sym_str = f"{{{','.join(self.symbols)}}}"
+        else:
+            sym_str = f"({ns} symbols)"
         return (
-            f"Portfolio[{{{','.join(self.positions.keys())}}} "
+            f"Portfolio[{sym_str} "
             f"{fmt_dollars(self.basis, width=0)} basis + "
             f"{fmt_dollars(self.credit, width=0)} cash = "
             f"{fmt_dollars(self.book_nlv, width=0)} book]"
