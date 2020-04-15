@@ -1,8 +1,8 @@
-from src.app import ARBApp
+from src.app import AutorebalanceApp
 
 
 def main() -> None:
-    app = ARBApp()
+    app = AutorebalanceApp()
     app.execute()
 
 

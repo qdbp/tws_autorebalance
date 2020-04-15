@@ -5,6 +5,7 @@ __pycache__/
 
 secrets
 data
+lib
 /autorebalance.ini
 
 # C extensions

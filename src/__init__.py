@@ -4,8 +4,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
-def secret_fn(basename: str) -> str:
-    return PROJECT_ROOT.joinpath("secrets").joinpath(basename).absolute().__str__()
+
+def secret_fn(basename: str) -> Path:
+    return PROJECT_ROOT.joinpath("secrets").joinpath(basename).absolute()
+
+
+def data_fn(basename: str) -> Path:
+    return PROJECT_ROOT.joinpath("data").joinpath(basename).absolute()
 
 
 def config() -> ConfigParser:

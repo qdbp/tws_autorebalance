@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from argparse import Namespace
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, date
 from io import StringIO
 from pathlib import Path
-from typing import List, DefaultDict, Dict, Set, Any, Tuple
+from typing import List, DefaultDict, Dict, Set, Any, Tuple, MutableMapping
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -19,12 +19,16 @@ from matplotlib.ticker import MultipleLocator
 
 from src import config
 from src.model.calc import calculate_profit_attributions, PAttrMode
+from src.model.constants import ONE_DAY
 from src.model.data import Trade, AttributionSet, Portfolio
 
 matplotlib.rc("figure", figsize=(12, 12))
 
 
-def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
+TradesSet = MutableMapping[str, Set[Trade]]
+
+
+def parse_ibkr_report_tradelog(path: Path) -> TradesSet:
 
     header_prefix = "Trades,Header,"
     data_prefix = "Trades,Data,Order,Stocks,"
@@ -42,7 +46,7 @@ def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
         elif line.startswith(data_prefix):
             data_lines.append(line[len(data_prefix) :])
 
-    out: DefaultDict[str, Set[Trade]] = defaultdict(set)
+    out: TradesSet = defaultdict(set)
 
     if not data_lines:
         return out
@@ -65,21 +69,51 @@ def parse_tws_trade_log(path: Path) -> DefaultDict[str, Set[Trade]]:
     return out
 
 
-def load_trade_logs(
+def parse_tws_exported_tradelog(path: Path) -> TradesSet:
+
+    df = pd.read_csv(path, parse_dates={"Datetime": ["Date", "Time"]})
+    out: TradesSet = defaultdict(set)
+
+    for _, row in df.iterrows():
+        qty = (-1 if row["Action"] == "SLD" else 1) * row["Quantity"]
+        t = row["Datetime"].to_pydatetime()
+        # commission is positive in these tables, hence +
+        price = row["Price"] + row["Commission"] / qty
+        sym = row["Symbol"]
+        out[sym].add(Trade(sym=sym, time=t, qty=qty, price=price))
+    return out
+
+
+def load_tradelogs(
     start: datetime = None, end: datetime = None
 ) -> Dict[str, List[Trade]]:
+
     trade_dir = Path(config()["trade_log"]["log_dir"]).expanduser()
     all_trades: DefaultDict[str, Set[Trade]] = defaultdict(set)
+
     for fn in trade_dir.glob("*.csv"):
-        fn_log = parse_tws_trade_log(fn)
+        fn_log = parse_ibkr_report_tradelog(fn)
         for sym, trades in fn_log.items():
-            all_trades[sym] |= {
+            all_trades[sym] |= trades
+
+    tws_log_today = Path(config()["trade_log"]["tws_log_dir"]).joinpath(
+        f'trades.{date.today().strftime("%Y%m%d")}.csv'
+    )
+    for k, trades in parse_tws_exported_tradelog(tws_log_today).items():
+        all_trades[k] |= trades
+
+    return {
+        sym: keep_trades
+        for sym, trades in all_trades.items()
+        if (
+            keep_trades := sorted(
                 tr
                 for tr in trades
-                if (start is None or start <= tr.time)
-                and (end is None or end >= tr.time)
-            }
-    return {sym: sorted(trades) for sym, trades in all_trades.items() if trades}
+                if (end is None or tr.time <= end)
+                and (start is None or tr.time >= start)
+            )
+        )
+    }
 
 
 def get_args() -> Namespace:
@@ -103,7 +137,6 @@ def get_args() -> Namespace:
     args.end = min(args.end, datetime.now())
 
     assert args.end >= args.start
-
     return args
 
 
@@ -153,16 +186,16 @@ def analyze_trades(
     mode: PAttrMode = "min_variation",
     ylim1: Tuple[int, int] = (-100, 300),
     ylim2: Tuple[int, int] = (-2000, 4000),
-) -> None:
+) -> Portfolio:
 
-
-    all_trades = load_trade_logs(start, end)
+    all_trades = load_tradelogs(start, end)
     portfolio = Portfolio()
     for ts in all_trades.values():
         for t in ts:
             portfolio.transact(t)
 
-    non_zero_syms = {pos.sym for pos in portfolio.positions if pos.qty != 0}
+    open_port = portfolio.filter(lambda pos: pos.qty > 0.0)
+    open_syms = open_port.symbols
 
     all_dates = []
     tot_cash = []
@@ -171,10 +204,12 @@ def analyze_trades(
 
     print(start, end)
 
-    delta = timedelta(days=1)
+    delta = ONE_DAY
     cur_date = start + delta
 
     while cur_date <= end:
+
+        residual_port = Portfolio()
 
         all_dates.append(cur_date)
         tot_cash.append(0.0)
@@ -185,7 +220,7 @@ def analyze_trades(
                 tuple(t for t in trades if t.time <= cur_date), mode=mode
             )
             for sym, trades in all_trades.items()
-            if sym in non_zero_syms
+            if sym in open_syms
         }
 
         tot_qty = 0
@@ -209,6 +244,8 @@ def analyze_trades(
 
             tot_cash[-1] += cash
             tot_basis[-1] += basis
+
+            residual_port._positions[sym] = pos
 
         if tot_qty > 0:
             weighted_av_price.append(tot_basis[-1] / tot_qty)
@@ -234,15 +271,17 @@ def analyze_trades(
     ax2.legend()
     ax1.set_title(f"Profits from {start.date()} to {cur_date.date()}, method='{mode}'")
     ax1.legend()
-    ax1.set_ylim(ylim1)
-    ax1.set_xlim(ax2.get_xlim())
-    ax2.set_ylim(ylim2)
+    ax1.set_ylim(*ylim1)
+    ax1.set_xlim(*ax2.get_xlim())
+    ax2.set_ylim(*ylim2)
     fig.show()
+
+    return residual_port
 
 
 def summarize_closed_positions() -> None:
 
-    all_trades = load_trade_logs()
+    all_trades = load_tradelogs()
     base_port = Portfolio.from_trade_dict(all_trades)
     portfolio = base_port.filter(lambda pos: pos.basis == 0.0)
 
@@ -257,5 +296,13 @@ def summarize_closed_positions() -> None:
 
 if __name__ == "__main__":
     args = get_args()
-    analyze_trades(args.start, args.end, mode="min_variation")
+    port = analyze_trades(args.start, args.end, mode="shortest")
+
+    print("Residual open positions:")
+    for pos in sorted(port.positions, key=lambda x: x.book_nlv):
+        print(pos)
+    print("")
+    print("Effective portfolio:")
+    print(port)
+
     summarize_closed_positions()

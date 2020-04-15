@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from configparser import ConfigParser
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from enum import Enum, auto
 from functools import total_ordering
 from logging import Logger
@@ -33,6 +33,7 @@ from matplotlib.ticker import FixedLocator, MultipleLocator, FuncFormatter
 
 from src import security as sec
 from src.model.calc_primitives import sgn, get_loan_at_target_utilization
+from src.model.constants import ONE_DAY
 from src.util.format import pp_order, fmt_dollars, assert_type
 
 
@@ -254,11 +255,10 @@ class ProfitAttribution:
         end_date = max(self.start_time, self.end_time).date()
 
         out = {}
-        one_day = timedelta(days=1)
         days_elapsed = 0
         while ix_date <= end_date:
             out[ix_date] = self.net_gain
-            ix_date += one_day
+            ix_date += ONE_DAY
             days_elapsed += 1
         assert days_elapsed > 0
         return {k: v / days_elapsed for k, v in out.items()}

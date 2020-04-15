@@ -1,25 +1,22 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 import time
 from configparser import ConfigParser
 from dataclasses import dataclass, fields
 from datetime import datetime
-from logging import getLogger, StreamHandler, Formatter, Logger, INFO
 from math import isclose
 from queue import Queue, Full
 from threading import Event, Thread
-from typing import Optional, Dict, Callable, Tuple, Any, TypeVar, NoReturn
+from typing import Optional, Dict, Tuple, Any, NoReturn
 
-from ibapi.client import EClient
 from ibapi.common import TickerId
 from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.order_state import OrderState
-from ibapi.wrapper import EWrapper
 
 from src import config
+from src.app.base import TWSApp, wrapper_override
 from src.model.calc import find_closest_portfolio, check_if_needs_rebalance
 from src.model.data import (
     OHLCBar,
@@ -33,20 +30,9 @@ from src.model.data import (
 from src.security import SecurityFault, PERMIT_ERROR, Policy, audit_order
 from src.util.format import pp_order, color
 
-with open("./secrets/acct.txt") as f:
-    ACCT = f.read()
-
-
-FNone = TypeVar("FNone", bound=Callable[..., None])
-
-
-def wrapper_override(f: FNone) -> FNone:
-    assert hasattr(EWrapper, f.__name__)
-    return f
-
 
 @dataclass(frozen=True)
-class AppConfig:
+class AutorebalanceConfig:
 
     # strategy
     dd_reference_ath: float
@@ -71,7 +57,7 @@ class AppConfig:
         assert self.misalloc_frac_force_coef > 0.0
 
     @classmethod
-    def read_config(cls, cfg: ConfigParser) -> AppConfig:
+    def read_config(cls, cfg: ConfigParser) -> AutorebalanceConfig:
 
         strategy = cfg["strategy"]
 
@@ -104,26 +90,16 @@ class AppConfig:
         )
 
 
-class ARBApp(EWrapper, EClient):
+class AutorebalanceApp(TWSApp):
+
+    APP_ID = 1337
 
     ACCT_SUM_REQ_ID = 10000
     PORTFOLIO_PRICE_REQ_ID = 30000
 
-    def _setup_log(self) -> Logger:
-        log = getLogger(self.__class__.__name__)
-        log.setLevel(INFO)
-        log.addHandler(StreamHandler(sys.stdout))
-        log.handlers[0].setFormatter(
-            Formatter("{asctime} {levelname:1s}@{funcName} ∷ {message}", style="{")
-        )
-        return log
-
     def __init__(self) -> None:
 
-        self.log = self._setup_log()
-
-        EWrapper.__init__(self)
-        EClient.__init__(self, wrapper=self)
+        TWSApp.__init__(self, self.APP_ID)
 
         # barriers
         self.initialized = Event()
@@ -147,7 +123,7 @@ class ARBApp(EWrapper, EClient):
         for k, v in self.target_composition.items():
             self.log.info(f"{k} <- {v * 100:.2f}%")
 
-        self.conf: AppConfig = AppConfig.read_config(config())
+        self.conf: AutorebalanceConfig = AutorebalanceConfig.read_config(config())
         self.log.info(f"Running with the following config:\n{self.conf.dump_config()}")
 
         self.liveness_event: Event = Event()
@@ -543,7 +519,7 @@ class ARBApp(EWrapper, EClient):
                 self.log.warning(color("I am armed.", "red"))
                 self.log.warning(color("Coffee's on me ☕", "sandy_brown"))
 
-            self.connect("127.0.0.1", 7496, clientId=1337)
+            self.ez_connect()
             Thread(target=self.run, daemon=True).start()
             self.initialized.wait()
 
