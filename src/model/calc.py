@@ -10,8 +10,8 @@ from pulp import LpInteger, LpProblem, LpMinimize, COIN, LpStatus
 from pulp_lparray import lparray
 
 from src import security as sec
+from src.model.calc_primitives import shrink
 from src.model.data import Composition, Trade, ProfitAttribution, Position
-from src.model.math import shrink
 
 
 def find_closest_portfolio(
@@ -89,7 +89,7 @@ def check_if_needs_rebalance(
 
     assert target_alloc >= 1
     assert cur_alloc >= 1
-    assert misalloc_frac_elbow > misalloc_min_fraction > 1.0
+    assert misalloc_frac_elbow >= misalloc_min_fraction > 1.0
     assert misalloc_frac_coef >= 0.0
 
     misalloc_frac = max(target_alloc / cur_alloc, cur_alloc / target_alloc)

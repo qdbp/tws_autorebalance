@@ -12,7 +12,6 @@ from queue import Queue, Full
 from threading import Event, Thread
 from typing import Optional, Dict, Callable, Tuple, Any, TypeVar, NoReturn
 
-from colorama import Fore
 from ibapi.client import EClient
 from ibapi.common import TickerId
 from ibapi.contract import Contract
@@ -31,8 +30,8 @@ from src.model.data import (
     OMState,
     OrderManager,
 )
-from src.model.util import pp_order
 from src.security import SecurityFault, PERMIT_ERROR, Policy, audit_order
+from src.util.format import pp_order, color
 
 with open("./secrets/acct.txt") as f:
     ACCT = f.read()
@@ -68,7 +67,7 @@ class AppConfig:
     def __post_init__(self) -> None:
         for field in fields(self):
             assert getattr(self, field.name) is not None
-        assert self.misalloc_frac_force_elbow > self.misalloc_min_frac > 1.0
+        assert self.misalloc_frac_force_elbow >= self.misalloc_min_frac > 1.0
         assert self.misalloc_frac_force_coef > 0.0
 
     @classmethod
@@ -198,7 +197,7 @@ class ARBApp(EWrapper, EClient):
             f"EwLV={self.acct_state.ewlv / 1000:.1f}k."
         )
         if self.conf.armed:
-            self.log.warning(Fore.RED + "I am armed." + Fore.RESET)
+            self.log.warning(color("I am armed.", "red"))
 
     @wrapper_override
     def position(
@@ -411,9 +410,10 @@ class ARBApp(EWrapper, EClient):
         # ^ DO NOT REORDER THESE CALLS v
         self.placeOrder(oid, nc, order)
         self.log.info(
-            (Fore.MAGENTA if not self.conf.armed else Fore.RED)
-            + f"Placed order {pp_order(nc, order)}."
-            + Fore.RESET
+            color(
+                f"Placed order {pp_order(nc, order)}.",
+                "magenta" if not self.conf.armed else "red",
+            )
         )
 
     def safe_cancel_order(self, oid: int) -> None:
@@ -521,7 +521,7 @@ class ARBApp(EWrapper, EClient):
         msg = f"TWS error channel: req({req_id}) ∷ {error_code} - {error_string}"
         # pacing violation
         if error_code == 420:
-            self.kill_app(Fore.GREEN + "🌿 error 420 🌿 you need to chill 🌿" + Fore.RESET)
+            self.kill_app(color("🌿 error 420 🌿 you need to chill 🌿", "green"))
         elif error_code in PERMIT_ERROR:
             {
                 "DEBUG": self.log.debug,
@@ -540,9 +540,8 @@ class ARBApp(EWrapper, EClient):
         try:
             self.log.info("I awaken. Greed is good!")
             if self.conf.armed:
-                self.log.warning(
-                    Fore.RED + "I am armed. " + Fore.CYAN + "I love you!" + Fore.RESET
-                )
+                self.log.warning(color("I am armed.", "red"))
+                self.log.warning(color("Coffee's on me ☕", "sandy_brown"))
 
             self.connect("127.0.0.1", 7496, clientId=1337)
             Thread(target=self.run, daemon=True).start()

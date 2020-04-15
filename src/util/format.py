@@ -1,7 +1,7 @@
 from functools import lru_cache
-from functools import lru_cache
 from typing import Literal, Any, TypeVar, Type
 
+from colored import fg, stylize
 from ibapi.contract import Contract
 from ibapi.order import Order
 
@@ -45,3 +45,8 @@ T = TypeVar("T")
 def assert_type(var: Any, typ: Type[T]) -> T:
     assert isinstance(var, typ), str(type(var))
     return var
+
+
+def color(msg: str, col: str) -> str:
+    out: str = stylize(msg, fg(col), reset=True)
+    return out

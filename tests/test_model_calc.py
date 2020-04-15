@@ -3,8 +3,8 @@ from _pytest.python_api import raises
 from ibapi.contract import Contract
 
 from src.model.calc import find_closest_portfolio
+from src.model.calc_primitives import shrink
 from src.model.data import Composition, NormedContract
-from src.model.math import shrink
 
 
 def test_allocator() -> None:

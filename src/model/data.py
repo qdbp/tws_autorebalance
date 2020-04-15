@@ -32,8 +32,8 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import FixedLocator, MultipleLocator, FuncFormatter
 
 from src import security as sec
-from src.model.math import sgn
-from src.model.util import pp_order, fmt_dollars, assert_type
+from src.model.calc_primitives import sgn, get_loan_at_target_utilization
+from src.util.format import pp_order, fmt_dollars, assert_type
 
 
 @dataclass(frozen=True, order=True)
@@ -608,27 +608,10 @@ class AcctState:
         return self.loan / ((1 - self.margin_req) * self.gpv)
 
     def get_loan_at_target_utilization(self, target_utilization: float) -> float:
-        """
-        Calculates the loan value with current position value at a given target
-        margin utilization.
-
-        Let
-            q := 1 - margin_req
-        Let
-            t := target margin utilization = L / (q * gpv(L))
-
-        Then:
-              L = t * q * (ewlv + L)
-            → L = q * t * ewlv / (1 - t * q)
-
-        """
-
-        assert 0 < target_utilization < 1
-
-        t = sec.Policy.MARGIN_USAGE.validate(target_utilization)
-        q = 1 - self.margin_req
-        loan = q * t * self.ewlv / (1 - t * q)
-
+        target_utilization = sec.Policy.MARGIN_USAGE.validate(target_utilization)
+        loan = get_loan_at_target_utilization(
+            self.ewlv, self.margin_req, target_utilization
+        )
         return sec.Policy.LOAN_AMT.validate(loan)
 
 

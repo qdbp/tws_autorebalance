@@ -19,12 +19,13 @@ from logging import getLogger, INFO, StreamHandler, Formatter, Logger
 from types import MappingProxyType
 from typing import TypeVar, Generic, Callable, Union
 
-from colorama import Fore, init as init_colorama
 from ibapi.order import Order
 
 from src import config
+from src.util.format import color
 
 # the poor man's frozendict
+
 PERMIT_ERROR = MappingProxyType(
     {
         504: "DEBUG",  # not connected -- always thrown on start
@@ -39,18 +40,12 @@ assert not set(PERMIT_ERROR.values()) - {"DEBUG", "INFO", "WARNING"}
 
 
 def init_sec_logger() -> Logger:
-    init_colorama()
-
     seclog = getLogger("FINSEC")
     seclog.setLevel(INFO)
     seclog.addHandler(StreamHandler(sys.stderr))
     seclog.handlers[0].setFormatter(
-        Formatter(
-            Fore.YELLOW + "{asctime} SEC-{levelname} ∷ {message}" + Fore.RESET,
-            style="{",
-        )
+        Formatter(color("{asctime} SEC-{levelname} ∷ {message}", "yellow"), style="{",)
     )
-
     return seclog
 
 
@@ -82,9 +77,12 @@ class ThreeTierGeneric(Generic[T]):
 
     def _confirm_danger(self, val: T) -> None:
         ans = input(
-            Fore.BLUE + f"SEC [{self.name}]"
-            f"({self.fmt_val(val)} {self.fmt_op()} {self.confirm_level}) "
-            f"'{self.confirm_msg}'. YES to confirm.\n" + Fore.RESET
+            color(
+                f"SEC [{self.name}]"
+                f"({self.fmt_val(val)} {self.fmt_op()} {self.confirm_level}) "
+                f"'{self.confirm_msg}'. YES to confirm.\n",
+                "blue",
+            )
         )
         if ans != "YES":
             raise SecurityFault(self.confirm_msg)
