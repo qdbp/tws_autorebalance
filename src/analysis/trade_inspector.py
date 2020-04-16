@@ -5,7 +5,17 @@ from collections import defaultdict
 from datetime import datetime, date
 from io import StringIO
 from pathlib import Path
-from typing import List, DefaultDict, Dict, Set, Any, Tuple, MutableMapping
+from typing import (
+    List,
+    DefaultDict,
+    Dict,
+    Set,
+    Any,
+    Tuple,
+    MutableMapping,
+    Container,
+    Optional,
+)
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -85,7 +95,9 @@ def parse_tws_exported_tradelog(path: Path) -> TradesSet:
 
 
 def load_tradelogs(
-    start: datetime = None, end: datetime = None
+    start: datetime = None,
+    end: datetime = None,
+    symbols: Optional[Container[str]] = None,
 ) -> Dict[str, List[Trade]]:
 
     trade_dir = Path(config()["trade_log"]["log_dir"]).expanduser()
@@ -115,6 +127,7 @@ def load_tradelogs(
                 and (start is None or tr.time >= start)
             )
         )
+        if symbols is None or sym in symbols
     }
 
 
@@ -188,7 +201,7 @@ def analyze_trades(
     mode: PAttrMode = "min_variation",
     ylim1: Tuple[int, int] = (-100, 300),
     ylim2: Tuple[int, int] = (-2000, 4000),
-) -> Portfolio:
+) -> AttributionSet:
 
     all_trades = load_tradelogs(start, end)
     portfolio = Portfolio()
@@ -204,15 +217,10 @@ def analyze_trades(
     tot_basis = []
     weighted_av_price = []
 
-    print(start, end)
-
     delta = ONE_DAY
     cur_date = start + delta
 
     while cur_date <= end:
-
-        residual_port = Portfolio()
-
         all_dates.append(cur_date)
         tot_cash.append(0.0)
         tot_basis.append(0.0)
@@ -237,17 +245,10 @@ def analyze_trades(
                 tot_qty += pos.qty
 
             attr_set.extend(pas)
-            net_pa = attr_set.get_total_for(sym)
-
-            if net_pa is None:
-                cash = pos_cash
-            else:
-                cash = net_pa.net_gain + pos_cash
+            cash = pos_cash + attr_set.net_gain_for_symbol(sym)
 
             tot_cash[-1] += cash
             tot_basis[-1] += basis
-
-            residual_port._positions[sym] = pos
 
         if tot_qty > 0:
             weighted_av_price.append(tot_basis[-1] / tot_qty)
@@ -278,7 +279,7 @@ def analyze_trades(
     ax2.set_ylim(*ylim2)
     fig.show()
 
-    return residual_port
+    return attr_set
 
 
 def summarize_closed_positions() -> None:
@@ -296,11 +297,18 @@ def summarize_closed_positions() -> None:
     print(portfolio)
 
 
-if __name__ == "__main__":
+def main() -> None:
     args = get_args()
 
     mode: PAttrMode
     for mode in ["shortest", "min_variation"]:
-        analyze_trades(args.start, args.end, mode=mode)
+        attr_set = analyze_trades(args.start, args.end, mode=mode)
+
+    fig = attr_set.plot_match("VOO")
+    fig.show()
 
     summarize_closed_positions()
+
+
+if __name__ == "__main__":
+    main()
