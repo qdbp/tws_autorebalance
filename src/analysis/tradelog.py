@@ -99,8 +99,10 @@ def load_tradelogs(
     tws_log_today = Path(config()["trade_log"]["tws_log_dir"]).joinpath(
         f'trades.{date.today().strftime("%Y%m%d")}.csv'
     )
-    for k, trades in parse_tws_exported_tradelog(tws_log_today).items():
-        all_trades[k] |= trades
+
+    if tws_log_today.exists():
+        for k, trades in parse_tws_exported_tradelog(tws_log_today).items():
+            all_trades[k] |= trades
 
     return {
         sym: keep_trades
@@ -296,13 +298,9 @@ def summarize_closed_positions() -> None:
 
 if __name__ == "__main__":
     args = get_args()
-    port = analyze_trades(args.start, args.end, mode="shortest")
 
-    print("Residual open positions:")
-    for pos in sorted(port.positions, key=lambda x: x.book_nlv):
-        print(pos)
-    print("")
-    print("Effective portfolio:")
-    print(port)
+    mode: PAttrMode
+    for mode in ["shortest", "min_variation"]:
+        analyze_trades(args.start, args.end, mode=mode)
 
     summarize_closed_positions()
