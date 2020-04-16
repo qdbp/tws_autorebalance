@@ -102,7 +102,6 @@ class AutorebalanceApp(TWSApp):
         TWSApp.__init__(self, self.APP_ID)
 
         # barriers
-        self.initialized = Event()
         self.workers_halt = Event()
 
         # state variables
@@ -130,15 +129,9 @@ class AutorebalanceApp(TWSApp):
         self.order_id_queue: Queue[int] = Queue(maxsize=1)
         self.order_manager = OrderManager(log=self.log)
 
-    @wrapper_override
-    def nextValidId(self, order_id: int) -> None:
-        # this is called once on app startup.
-        if not self.initialized.is_set():
-            self.initialized.set()
-            return
-
+    def next_requested_id(self, oid: int) -> None:
         try:
-            self.order_id_queue.put_nowait(order_id)
+            self.order_id_queue.put_nowait(oid)
         except Full:
             self.kill_app("Full order queue -- should not be possible.")
 
@@ -520,8 +513,6 @@ class AutorebalanceApp(TWSApp):
                 self.log.warning(color("Coffee's on me ☕", "sandy_brown"))
 
             self.ez_connect()
-            Thread(target=self.run, daemon=True).start()
-            self.initialized.wait()
 
             Thread(target=self.liveness_worker, daemon=True).start()
             Thread(target=self.acct_update_worker, daemon=True).start()

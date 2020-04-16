@@ -1,9 +1,18 @@
 import sys
+from abc import abstractmethod
 from logging import Logger, getLogger, INFO, StreamHandler, Formatter
+from threading import Event, Thread
 from typing import TypeVar, Callable
 
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
+
+FNone = TypeVar("FNone", bound=Callable[..., None])
+
+
+def wrapper_override(f: FNone) -> FNone:
+    assert hasattr(EWrapper, f.__name__)
+    return f
 
 
 class TWSApp(EClient, EWrapper):
@@ -26,6 +35,8 @@ class TWSApp(EClient, EWrapper):
 
         self.log = self._setup_log()
 
+        self._initialized = Event()
+
     def _setup_log(self) -> Logger:
         log = getLogger(self.__class__.__name__)
         log.setLevel(INFO)
@@ -35,13 +46,22 @@ class TWSApp(EClient, EWrapper):
         )
         return log
 
+    @wrapper_override
+    def nextValidId(self, oid: int):
+        if not self._initialized.is_set():
+            self._initialized.set()
+            return
+        else:
+            self.next_requested_id(oid)
+
+    @abstractmethod
+    def next_requested_id(self, oid: int) -> None:
+        """
+        This method should implement the actual logic of "nextValidId" as it is used
+        after the initialization call.
+        """
+
     def ez_connect(self) -> None:
         super().connect("127.0.0.1", self.TWS_DEFAULT_PORT, self.client_id)
-
-
-FNone = TypeVar("FNone", bound=Callable[..., None])
-
-
-def wrapper_override(f: FNone) -> FNone:
-    assert hasattr(EWrapper, f.__name__)
-    return f
+        Thread(target=self.run, daemon=True).start()
+        self._initialized.wait()
