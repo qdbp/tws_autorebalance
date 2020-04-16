@@ -174,6 +174,7 @@ def calculate_profit_attributions(
 
     # we ensure that we always decrease our loss by making any assignment to guarantee
     # that all min(nb, ns) possible shares are matched.
+    # noinspection PyArgumentList
     loss -= loss.max() + 1.0
 
     sell_qty_limit = np.array([-t.qty for t in sells], dtype=np.uint32)
@@ -201,13 +202,16 @@ def calculate_profit_attributions(
         buy = buys[bx]
         sell = sells[sx]
         assert buy.sym == sell.sym
+
+        attributed_qty = int(solution[bx, sx])
+
+        new_buy: Trade = replace(buy, qty=attributed_qty)
+        new_sell: Trade = replace(sell, qty=-attributed_qty)
+
         pas.append(
             ProfitAttribution(
-                sym=buy.sym,
-                start_time=min(buy.time, sell.time),
-                end_time=max(buy.time, sell.time),
-                qty=int(solution[bx, sx]),
-                net_gain=solution[bx, sx] * (sell.price - buy.price),
+                open_trade=new_buy if new_buy.time < new_sell.time else new_sell,
+                close_trade=new_buy if new_buy.time > new_sell.time else new_sell,
             )
         )
 

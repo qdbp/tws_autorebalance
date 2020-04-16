@@ -20,6 +20,7 @@ from typing import (
     ItemsView,
     KeysView,
     ValuesView,
+    Collection,
 )
 
 import numpy as np
@@ -235,13 +236,14 @@ class Portfolio:
 @dataclass(frozen=True, order=True)
 class ProfitAttribution:
 
-    __slots__ = ("sym", "start_time", "end_time", "qty", "net_gain")
+    __slots__ = ("open_trade", "close_trade")
 
-    sym: str
-    start_time: datetime
-    end_time: datetime
-    qty: int
-    net_gain: float
+    open_trade: Trade
+    close_trade: Trade
+
+    def __post_init__(self) -> None:
+        assert self.open_trade.sym == self.close_trade.sym
+        assert self.close_trade.qty + self.open_trade.qty == 0
 
     @property
     def daily_attribution(self) -> Dict[date, float]:
@@ -263,6 +265,49 @@ class ProfitAttribution:
         assert days_elapsed > 0
         return {k: v / days_elapsed for k, v in out.items()}
 
+    @property
+    def start_time(self) -> datetime:
+        return min(self.open_trade.time, self.close_trade.time)
+
+    @property
+    def end_time(self) -> datetime:
+        return max(self.open_trade.time, self.close_trade.time)
+
+    @property
+    def qty(self) -> int:
+        # this is guaranteed by init to be the same as for the closing trade
+        return abs(self.open_trade.qty)
+
+    @property
+    def sym(self) -> str:
+        return self.open_trade.sym
+
+    @property
+    def is_long(self) -> bool:
+        return self.open_trade.qty > 0
+
+    @property
+    def is_short(self) -> bool:
+        return self.open_trade.qty < 0
+
+    @property
+    def buy_price(self) -> float:
+        if self.is_long:
+            return self.open_trade.price
+        else:
+            return self.close_trade.price
+
+    @property
+    def sell_price(self) -> float:
+        if self.is_long:
+            return self.close_trade.price
+        else:
+            return self.open_trade.price
+
+    @property
+    def net_gain(self) -> float:
+        return self.qty * (self.sell_price - self.buy_price)
+
     def __str__(self) -> str:
         return (
             f"ProfitAttr({self.sym} x {self.qty}: {self.net_gain:.2f} for "
@@ -280,34 +325,6 @@ class AttributionSet:
         self.pas.extend(pas)
         self.pas.sort()
 
-    def get_total_for(self, symbol: str) -> Optional[ProfitAttribution]:
-
-        sym_pas = sorted(pa for pa in self.pas if pa.sym == symbol)
-        if not sym_pas:
-            return None
-
-        return ProfitAttribution(
-            symbol,
-            min(pa.start_time for pa in sym_pas),
-            max(pa.end_time for pa in sym_pas),
-            sum(pa.qty for pa in sym_pas),
-            sum(pa.net_gain for pa in sym_pas),
-        )
-
-    @property
-    def get_grand_total(self) -> Optional[ProfitAttribution]:
-
-        if not self.pas:
-            return None
-
-        return ProfitAttribution(
-            "__TOTAL__",
-            min(pa.start_time for pa in self.pas),
-            max(pa.end_time for pa in self.pas),
-            sum(pa.qty for pa in self.pas),
-            sum(pa.net_gain for pa in self.pas),
-        )
-
     @property
     def net_daily_attr(self) -> Dict[date, float]:
         out: Dict[date, float] = {}
@@ -318,6 +335,13 @@ class AttributionSet:
         # TODO this is a pycharm bug
         # noinspection PyTypeChecker
         return dict(sorted(out.items()))
+
+    @property
+    def total_net_gain(self) -> float:
+        return sum(pa.net_gain for pa in self.pas)
+
+    def net_gain_for_symbol(self, sym: str) -> float:
+        return sum(pa.net_gain for pa in self.pas if pa.sym == sym)
 
     @property
     def all_symbols(self) -> Set[str]:
@@ -335,7 +359,7 @@ class AttributionSet:
     def pas_by_profit(self) -> List[ProfitAttribution]:
         return sorted(self.pas, key=lambda pa: pa.net_gain)
 
-    def plot(self, only_symbols: Set[str] = None) -> Figure:
+    def plot_spans(self, only_symbols: Collection[str] = None) -> Figure:
 
         fig: Figure = plt.figure()
         ax: Axes = fig.subplots()
@@ -388,6 +412,20 @@ class AttributionSet:
         ax.grid(axis="y", which="major", lw=3.0, color="k")
         ax.grid(which="minor", lw=0.25)
         fig.set_size_inches((12, 8))
+        return fig
+
+    def plot_match(self, symbol: str) -> Figure:
+
+        pas = sorted(
+            [pa for pa in self.pas if pa.sym == symbol], key=lambda x: x.buy_price
+        )
+
+        fig, ax = plt.subplots(1, 1)
+
+        ax.plot([pa.buy_price for pa in pas], marker="o", lw=0, ms=5, label="buys")
+        ax.plot([pa.sell_price for pa in pas], marker="o", lw=0, ms=5, label="sells")
+        ax.legend()
+
         return fig
 
 
