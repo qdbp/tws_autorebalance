@@ -1,11 +1,18 @@
 from datetime import date, time, datetime
 from sqlite3 import Connection, connect
 from threading import Event
+from types import MappingProxyType
 from typing import Literal, get_args as get_type_args, Iterable
 
 from ibapi.common import BarData
-from pandas import DataFrame, read_sql
-from pytz.reference import Eastern
+from pandas import (
+    DataFrame,
+    read_sql,
+    to_datetime,
+    bdate_range,
+    DatetimeIndex,
+)
+from pytz import timezone, UTC
 
 from src import data_fn, config
 from src.app.base import TWSApp, wrapper_override
@@ -15,7 +22,29 @@ from src.util.format import color
 
 TickType = Literal["mid", "bid", "ask", "trades"]
 
-TWS_END_DATE_FMT = "%Y%m%d %H:%M:%S"
+TWS_END_DATE_FMT = "%Y%m%d %H:%M:%S EST"
+
+
+VALID_INTERVALS = MappingProxyType(
+    {
+        1: "1 sec",
+        5: "5 secs",
+        15: "15 secs",
+        30: "30 secs",
+        60: "1 min",
+        2 * 60: "2 mins",
+        3 * 60: "3 mins",
+        5 * 60: "5 mins",
+        15 * 60: "15 mins",
+        30 * 60: "30 mins",
+        3600: "1 hour",
+        24 * 3600: "1 day",
+    }
+)
+
+
+def validate_interval(interval: int) -> None:
+    assert interval in VALID_INTERVALS
 
 
 class PriceLoaderApp(TWSApp):
@@ -31,17 +60,17 @@ class PriceLoaderApp(TWSApp):
         assert typ in get_type_args(TickType)
         return f"prices_{symbol.lower()}_{typ}_{interval}s"
 
-    def __init__(self, db_name: str, try_connect=True):
+    def __init__(self, db_name: str, try_connect=True, tz=timezone("US/Eastern")):
 
         TWSApp.__init__(self, self.APP_ID)
 
+        self.tz = tz
         self.db_path = data_fn(db_name)
         self.online: bool
 
         self.online = False
 
-        self.log.info(color("Data monkey 1 is awake.", "yellow",))
-
+        self.log.info(color("Data monkey prime is awake.", "yellow",))
         if try_connect:
             try:
                 self.ez_connect()
@@ -73,18 +102,19 @@ class PriceLoaderApp(TWSApp):
             ) WITHOUT ROWID;
         """
 
-        with self.db_conn:
-            self.db_conn.execute(schema)
+        with self.db_conn as c:
+            c.execute(schema)
 
     def create_price_table(self, symbol: str, interval: int, typ: TickType) -> None:
+        validate_interval(interval)
         schema = f"""
             CREATE TABLE IF NOT EXISTS 
             {self.get_table_name(symbol, interval, typ)} (
-                usecs TEXT PRIMARY KEY,
-                o REAL NOT NULL,
-                h REAL NOT NULL, 
-                l REAL NOT NULL,
-                c REAL NOT NULL,
+                usecs TEXT PRIMARY KEY
+                , o REAL NOT NULL
+                , h REAL NOT NULL
+                , l REAL NOT NULL
+                , c REAL NOT NULL
         ) WITHOUT ROWID ;
         """
 
@@ -97,6 +127,7 @@ class PriceLoaderApp(TWSApp):
         interval: int,
         tick_type: TickType,
         ticks: Iterable[OHLCBar],
+        requested_day: date,
         *,
         timing_tol: float = 1e-2,
         max_gap: float = 2.1,
@@ -140,28 +171,39 @@ class PriceLoaderApp(TWSApp):
         Returns:
 
         """
+        validate_interval(interval)
 
         sorted_ticks = sorted(ticks)
         assert sorted_ticks
 
-        first_dtt = datetime.fromtimestamp(sorted_ticks[0].t, tz=Eastern)
-        last_dtt = datetime.fromtimestamp(sorted_ticks[-1].t, tz=Eastern)
+        first_dtt = datetime.fromtimestamp(sorted_ticks[0].t, tz=UTC).astimezone(
+            self.tz
+        )
+        last_dtt = datetime.fromtimestamp(sorted_ticks[-1].t, tz=UTC).astimezone(
+            self.tz
+        )
 
         tick_date = first_dtt.date()
 
-        open_dtt = datetime.combine(tick_date, market_open)
-        close_dtt = datetime.combine(tick_date, market_close)
+        if is_holiday := (tick_date != requested_day):
+            self.log.warning(
+                "Got ticks for day other than requested. "
+                "Assuming requested day is a holiday."
+            )
+
+        open_dtt = datetime.combine(tick_date, market_open).astimezone(self.tz)
+        close_dtt = datetime.combine(tick_date, market_close).astimezone(self.tz)
 
         # check boundaries
         if not abs((first_dtt - open_dtt).total_seconds()) <= open_tol * interval:
             raise ValueError(f"First tick {first_dtt} too far from open")
         if not abs((last_dtt - close_dtt).total_seconds()) <= close_tol * interval:
-            raise ValueError(f"Last tick {first_dtt} too far from open")
+            raise ValueError(f"Last tick {last_dtt} too far from close")
 
         # check gaps
         gaps = 0
-        for p0, p1 in zip(sorted_ticks[1:], sorted_ticks[:-1]):
-            if (gap := abs(p1.t - p0.t)) < interval * timing_tol:
+        for p1, p0 in zip(sorted_ticks[1:], sorted_ticks[:-1]):
+            if (gap := abs(p1.t - p0.t - interval)) < interval * timing_tol:
                 continue
             elif gap > interval * max_gap:
                 raise ValueError(
@@ -179,17 +221,22 @@ class PriceLoaderApp(TWSApp):
 
         self.create_price_table(sym, interval, tick_type)
 
-        with self.db_conn:
-            self.db_conn.executemany(
+        with self.db_conn as c:
+            c.executemany(
                 schema, [(ti.t, ti.o, ti.h, ti.l, ti.c) for ti in sorted_ticks]
             )
-
-            self.db_conn.execute(
+            c.execute(
                 f"""
                 INSERT OR REPLACE INTO prices_meta
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (sym, interval, tick_type, tick_date.strftime(self.META_DATE_FMT)),
+                (
+                    sym,
+                    interval,
+                    tick_type,
+                    requested_day.strftime(self.META_DATE_FMT),
+                    is_holiday,
+                ),
             )
 
     def load_price_data(
@@ -198,8 +245,8 @@ class PriceLoaderApp(TWSApp):
 
         sym = nc.symbol
 
-        with self.db_conn:
-            in_meta = self.db_conn.execute(
+        with self.db_conn as c:
+            in_meta = c.execute(
                 f"""SELECT * FROM prices_meta
                 WHERE sym=? AND interval=?
                 AND tick_type=? AND day={day.strftime(self.META_DATE_FMT)}
@@ -208,57 +255,76 @@ class PriceLoaderApp(TWSApp):
             ).fetchall()
 
         if not in_meta:
+            self.log.info(
+                f"Requesting data for {nc.symbol} @ {day}, {tick_type}/{interval}"
+            )
+
             self._prices_loaded.clear()
-            # we never have multiple requests in flight, so we hardcode an arbitrary id
-            req_id = 1000
+            self._prices_buffer.clear()
+
+            if tick_type == "mid":
+                to_show = "MIDPOINT"
+            else:
+                to_show = tick_type.upper()
+
+            # we never have multiple requests in flight, so duplicates are fine
+            req_id = int(day.strftime("%Y%m%d"))
             end_str = (day + ONE_DAY).strftime(TWS_END_DATE_FMT)
+
             self.reqHistoricalData(
                 reqId=req_id,
                 contract=nc,
                 endDateTime=end_str,
+                # this is hardcoded since one-day blocks are fundamental to how we
+                # process price data
                 durationStr="1 D",
-                barSizeSetting=f"{interval} S",
-                whatToShow=tick_type.upper(),
+                barSizeSetting=VALID_INTERVALS[interval],
+                whatToShow=to_show,
                 useRTH=True,
                 keepUpToDate=False,
+                # 1 = string format; 2 = unix seconds int
                 formatDate=2,
-                # when used with kwargs this one is required for some reason...
+                # TWS requires this...
                 chartOptions=[],
             )
             self._prices_loaded.wait()
-            self.store_price_tickers(sym, interval, tick_type, self._prices_buffer)
+            self.store_price_tickers(
+                sym, interval, tick_type, self._prices_buffer, requested_day=day
+            )
 
         # we get data for the entire day, ignoring market open/close times,
         # the correct handling of which is assured by store_price_tickers
-        start = datetime.combine(day, time(), tzinfo=Eastern).timestamp()
-        end = datetime.combine(
-            day + ONE_DAY, time(), tzinfo=Eastern
-        ).timestamp()
+        start = datetime.combine(day, time()).astimezone(self.tz).timestamp()
+        end = datetime.combine(day + ONE_DAY, time()).astimezone(self.tz).timestamp()
 
         # noinspection SqlResolve
-        return read_sql(
+        out = read_sql(
             f"""
             SELECT * FROM {self.get_table_name(sym, interval, tick_type)}
-            WHERE utime < end AND utime >= start
+            WHERE usecs < {end} AND usecs >= {start}
         """,
             self.db_conn,
+            index_col="usecs",
         )
 
+        # noinspection PyTypeChecker
+        # bad to_datetime inferred return type
+        index: DatetimeIndex = to_datetime(out.index, unit="s", utc=True)
+        index = index.tz_convert(tz="US/Eastern")
+        out.index = index
+        return out
+
     @wrapper_override
-    def historicalData(self, req_id: int, bar: BarData):
+    def historicalData(self, req_id: int, bar: BarData) -> None:
         # TODO this is a little silly... but I think it's best to stick with
         # an in-house bar
-        print(bar)
-        ohlc = OHLCBar(t=bar.date, o=bar.open, h=bar.high, l=bar.low, c=bar.close,)
+        ohlc = OHLCBar(t=int(bar.date), o=bar.open, h=bar.high, l=bar.low, c=bar.close,)
         self._prices_buffer.append(ohlc)
 
     @wrapper_override
-    def historicalDataEnd(self, req_id: int, start: str, end: str):
+    def historicalDataEnd(self, req_id: int, start: str, end: str) -> None:
+        self.log.info(f"Received historical dataset, {len(self._prices_buffer)} bars.")
         self._prices_loaded.set()
-
-    def stop(self) -> None:
-        self.disconnect()
-        self.log.info("Disconnected.")
 
     def error(self, req_id: int, code: int, msg: str):
         self.log.error(f"TWS error {req_id} -> {code} -> {msg}")
@@ -267,7 +333,11 @@ class PriceLoaderApp(TWSApp):
 if __name__ == "__main__":
 
     target_composition = Composition.parse_ini_composition(config())
-    arkw = NormedContract.from_symbol_and_pex("ARKW", "AMEX")
+    tick_type: TickType
 
     app = PriceLoaderApp("prices.db")
-    app.load_price_data(arkw, 60, "mid", date.today() - ONE_DAY)
+    for nc in target_composition.keys():
+        for date in bdate_range("2020-03-17", "2020-04-15"):
+            for tick_type in ["mid", "bid", "ask"]:
+                out = app.load_price_data(nc, 60, tick_type, date)
+    app.shut_down()

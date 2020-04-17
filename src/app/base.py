@@ -65,3 +65,7 @@ class TWSApp(EClient, EWrapper):
         super().connect("127.0.0.1", self.TWS_DEFAULT_PORT, self.client_id)
         Thread(target=self.run, daemon=True).start()
         self._initialized.wait()
+
+    def shut_down(self) -> None:
+        if self.isConnected():
+            self.disconnect()
