@@ -502,8 +502,14 @@ class AutorebalanceApp(TWSApp):
 
     def kill_app(self, msg: str) -> NoReturn:
         self.log.critical(f"Killed: {msg}")
-        self.workers_halt.set()
+        self.shut_down()
         raise SecurityFault(msg)
+
+    def shut_down(self) -> None:
+        for nc in self.target_composition.keys():
+            self.clear_any_untransmitted_order(nc)
+        self.workers_halt.set()
+        super().shut_down()
 
     def execute(self) -> None:
         try:
@@ -524,8 +530,5 @@ class AutorebalanceApp(TWSApp):
             rebalance_worker.join()
 
         finally:
-            self.workers_halt.set()
-            for nc in self.target_composition.keys():
-                self.clear_any_untransmitted_order(nc)
             self.log.info("Disconnecting. I hope I didn't lose too much money!")
-            self.disconnect()
+            self.shut_down()
