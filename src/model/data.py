@@ -763,7 +763,7 @@ class OrderManager:
 
     def print_book(self) -> None:
         for nc, state in self._order_state.items():
-            msg = f"Order Book: {state}"
+            msg = f"Order Book: {nc.symbol} = {state}"
             if state == OMState.ENTERED or state == OMState.TRANSMITTED:
                 order = self._orders[nc]
                 msg += f": {pp_order(nc, order)}"
