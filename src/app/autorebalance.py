@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import subprocess
-import time
 from configparser import ConfigParser
 from dataclasses import dataclass, fields
-from datetime import datetime
+from datetime import datetime, time
 from math import isclose
 from queue import Queue, Full
 from threading import Event, Thread
+from time import sleep
+from time import time as unix_time
 from typing import Optional, Dict, Tuple, Any, NoReturn
 
 from ibapi.common import TickerId
@@ -289,7 +290,7 @@ class AutorebalanceApp(TWSApp):
         if not self.pricing_complete:
             return float("inf")
         else:
-            return time.time() - min(o.t for o in self.portfolio_prices.values())
+            return unix_time() - min(o.t for o in self.portfolio_prices.values())
 
     @property
     def is_live(self) -> bool:
@@ -388,7 +389,7 @@ class AutorebalanceApp(TWSApp):
     def safe_cancel_order(self, oid: int) -> None:
         self.cancelOrder(oid)
         # TODO this is rather weak, but without a callback...
-        time.sleep(0.1)
+        sleep(0.1)
 
     def notify_desktop(self, msg: str) -> None:
         subprocess.run(
@@ -396,6 +397,8 @@ class AutorebalanceApp(TWSApp):
         )
 
     def rebalance_worker(self) -> None:
+
+        last_ideal_alloc = None
 
         while not self.workers_halt.is_set():
 
@@ -443,13 +446,17 @@ class AutorebalanceApp(TWSApp):
                         max(1 - target_alloc / cur_alloc, 1 - cur_alloc / target_alloc),
                     )
 
-            ideal_fmt = ", ".join(
-                f"{sym}{delta:+}(${dollars:.0f}/{frac * 100:.2f}%)"
-                for sym, (delta, dollars, frac) in sorted(
-                    ideal_allocation_delta.items(), key=lambda x: -x[1][1]
+            if last_ideal_alloc is None or (ideal_allocation_delta.items()) != sorted(
+                last_ideal_alloc.items()
+            ):
+                ideal_fmt = ", ".join(
+                    f"{sym}{delta:+}(${dollars:.0f}/{frac * 100:.2f}%)"
+                    for sym, (delta, dollars, frac) in sorted(
+                        ideal_allocation_delta.items(), key=lambda x: -x[1][1]
+                    )
                 )
-            )
-            self.log.info(f"Ideal (mu={target_mu * 100:.2f}%) = {ideal_fmt}")
+                self.log.info(f"Ideal (mu={target_mu * 100:.2f}%) = {ideal_fmt}")
+                last_ideal_alloc = ideal_allocation_delta.copy()
 
             if len(self.rebalance_target) > 0:
                 self.log.info(
@@ -463,7 +470,7 @@ class AutorebalanceApp(TWSApp):
                 self.order_manager.print_book()
                 self.notify_desktop(rebalance_msg)
 
-            time.sleep(self.conf.rebalance_freq)
+            sleep(self.conf.rebalance_freq)
 
     def acct_update_worker(self) -> None:
 
@@ -473,7 +480,7 @@ class AutorebalanceApp(TWSApp):
                 "All",
                 "EquityWithLoanValue,GrossPositionValue,MaintMarginReq",
             )
-            time.sleep(60.0)
+            sleep(60.0)
 
     def liveness_worker(self) -> None:
         while not self.workers_halt.is_set():
@@ -481,7 +488,7 @@ class AutorebalanceApp(TWSApp):
                 self.liveness_event.clear()
             else:
                 self.liveness_event.set()
-            time.sleep(0.1)
+            sleep(0.1)
         else:
             self.liveness_event.clear()
 
@@ -532,3 +539,17 @@ class AutorebalanceApp(TWSApp):
         finally:
             self.log.info("Disconnecting. I hope I didn't lose too much money!")
             self.shut_down()
+
+
+def arb_entrypoint() -> None:
+    while True:
+        now = datetime.now()
+        if not time(hour=9, minute=29, second=30) <= now.time() <= time(
+            hour=16, minute=0, second=0
+        ) or now.date().weekday() in (5, 6):
+            sleep(30)
+        try:
+            app = AutorebalanceApp()
+            app.execute()
+        finally:
+            continue
