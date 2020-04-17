@@ -414,19 +414,16 @@ class AttributionSet:
         fig.set_size_inches((12, 8))
         return fig
 
-    def plot_match(self, symbol: str) -> Figure:
+    def plot_match(self, symbol: str, ax: Axes, **plot_kwargs) -> None:
 
         pas = sorted(
             [pa for pa in self.pas if pa.sym == symbol], key=lambda x: x.buy_price
         )
+        buys = np.array([pa.buy_price for pa in pas for _ in range(abs(pa.qty))])
+        sells = np.array([pa.sell_price for pa in pas for _ in range(abs(pa.qty))])
 
-        fig, ax = plt.subplots(1, 1)
-
-        ax.plot([pa.buy_price for pa in pas], marker="o", lw=0, ms=5, label="buys")
-        ax.plot([pa.sell_price for pa in pas], marker="o", lw=0, ms=5, label="sells")
-        ax.legend()
-
-        return fig
+        ax.fill_between(range(len(buys)), buys, np.maximum(buys, sells), facecolor='green')
+        ax.fill_between(range(len(buys)), sells, np.maximum(buys, sells), facecolor='red')
 
 
 @total_ordering

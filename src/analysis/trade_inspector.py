@@ -15,7 +15,7 @@ from typing import (
     MutableMapping,
     Container,
     Optional,
-)
+    Collection)
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -27,10 +27,10 @@ from matplotlib.dates import WeekdayLocator, DateFormatter
 from matplotlib.figure import Figure
 from matplotlib.ticker import MultipleLocator
 
-from src import config
+from src import config, data_fn
 from src.model.calc import calculate_profit_attributions, PAttrMode
 from src.model.constants import ONE_DAY
-from src.model.data import Trade, AttributionSet, Portfolio
+from src.model.data import Trade, AttributionSet, Portfolio, Composition
 
 matplotlib.rc("figure", figsize=(12, 12))
 
@@ -160,21 +160,24 @@ def plot_trade_profits(
 ) -> Tuple[Figure, Axes, Axes]:
 
     net_daily = attr_set.net_daily_attr
-
     dates, dailies = zip(*list(net_daily.items()))
 
     ax1: Axes
     ax2: Axes
     fig, (ax1, ax2) = plt.subplots(2, 1)
 
+    # date locators
     for ax in (ax1, ax2):
         ax.xaxis.set_major_locator(WeekdayLocator(byweekday=MO))
+        # one day
         ax.xaxis.set_minor_locator(MultipleLocator(1))
         ax.grid()
         ax.grid(which="minor", lw=0.25)
 
+    ax1.yaxis.set_minor_locator(MultipleLocator(10))
+    ax2.yaxis.set_minor_locator(MultipleLocator(200))
+
     ax2.xaxis.set_major_formatter(DateFormatter("%m-%d"))
-    # ax2.xaxis.set_minor_formatter(DateFormatter("%a"))
 
     ax1.plot(dates, dailies, label="daily profits (back-projected)", **plot_kwargs)
     ax1.set_xticklabels([])
@@ -197,6 +200,7 @@ def plot_trade_profits(
 def analyze_trades(
     start: datetime,
     end: datetime,
+    symbols: Collection[str],
     *,
     mode: PAttrMode = "min_variation",
     ylim1: Tuple[int, int] = (-100, 300),
@@ -204,13 +208,6 @@ def analyze_trades(
 ) -> AttributionSet:
 
     all_trades = load_tradelogs(start, end)
-    portfolio = Portfolio()
-    for ts in all_trades.values():
-        for t in ts:
-            portfolio.transact(t)
-
-    open_port = portfolio.filter(lambda pos: pos.qty > 0.0)
-    open_syms = open_port.symbols
 
     all_dates = []
     tot_cash = []
@@ -230,7 +227,7 @@ def analyze_trades(
                 tuple(t for t in trades if t.time <= cur_date), mode=mode
             )
             for sym, trades in all_trades.items()
-            if sym in open_syms
+            if sym in symbols
         }
 
         tot_qty = 0
@@ -300,12 +297,17 @@ def summarize_closed_positions() -> None:
 def main() -> None:
     args = get_args()
 
+    symbols = {nc.symbol for nc in Composition.parse_ini_composition(config())}
+
     mode: PAttrMode
     for mode in ["shortest", "min_variation"]:
-        attr_set = analyze_trades(args.start, args.end, mode=mode)
+        attr_set = analyze_trades(args.start, args.end, symbols, mode=mode)
 
-    fig = attr_set.plot_match("VOO")
-    fig.show()
+    for symbol in symbols:
+        fig, ax = plt.subplots(1, 1)
+        attr_set.plot_match(symbol, ax)
+        ax.set_title(symbol)
+        fig.savefig(data_fn(f'{symbol}_tradeplot.png'))
 
     summarize_closed_positions()
 
