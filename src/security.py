@@ -207,10 +207,10 @@ class Policy:
     )
 
     # number of seconds to wait before the same contract can be traded again
-    ORDER_COOLOFF = 300
+    ORDER_COOLOFF = 60
 
-    MAX_PRICING_AGE = 100  # seconds
-    MAX_ACCT_SUM_AGE = 100  # seconds
+    MAX_PRICING_AGE = 20  # seconds
+    MAX_ACCT_SUM_AGE = 20  # seconds
 
 
 def audit_order(order: Order) -> Order:
