@@ -22,7 +22,7 @@ from src.model.calc import find_closest_portfolio, check_if_needs_rebalance
 from src.model.data import (
     OHLCBar,
     Trade,
-    NormedContract,
+    SimpleContract,
     Composition,
     AcctState,
     OMState,
@@ -107,15 +107,15 @@ class AutorebalanceApp(TWSApp):
 
         # state variables
         self.acct_state: Optional[AcctState] = None
-        self.price_watchers: Dict[int, NormedContract] = {}
-        self.portfolio: Optional[Dict[NormedContract, int]] = None
-        self.portfolio_prices: Dict[NormedContract, OHLCBar] = {}
-        self.last_trade: Dict[NormedContract, Trade] = {}
+        self.price_watchers: Dict[int, SimpleContract] = {}
+        self.portfolio: Optional[Dict[SimpleContract, int]] = None
+        self.portfolio_prices: Dict[SimpleContract, OHLCBar] = {}
+        self.last_trade: Dict[SimpleContract, Trade] = {}
 
         # accumulator variables
-        self.rebalance_target: Dict[NormedContract, int] = {}
+        self.rebalance_target: Dict[SimpleContract, int] = {}
         self.acc_sum_acc: Dict[str, float] = {}
-        self.position_acc: Dict[NormedContract, int] = {}
+        self.position_acc: Dict[SimpleContract, int] = {}
 
         # market config
         self.target_composition = Composition.parse_ini_composition(config())
@@ -177,14 +177,14 @@ class AutorebalanceApp(TWSApp):
         if contract.secType != "STK":
             return
 
-        nc = NormedContract.normalize_contract(contract)
+        sc = SimpleContract.from_contract(contract)
         assert isclose(position, int_pos := int(position))
-        self.position_acc[nc] = int_pos
+        self.position_acc[sc] = int_pos
 
     @wrapper_override
     def positionEnd(self) -> None:
 
-        pos_data: Dict[NormedContract, int] = self.position_acc.copy()
+        pos_data: Dict[SimpleContract, int] = self.position_acc.copy()
         self.position_acc.clear()
 
         self.log.info(
@@ -199,19 +199,20 @@ class AutorebalanceApp(TWSApp):
             self.portfolio.update(pos_data)
 
         # correct bad primary exchanges in our composition
-        for k in self.portfolio.keys():
-            for kc in self.target_composition.keys():
-                if k == kc:
-                    kc.primaryExchange = k.primaryExchange
+        for new_k in self.portfolio.keys():
+            for old_comp_k, target in set(self.target_composition.items()):
+                if new_k.symbol == old_comp_k.symbol and new_k.pex != old_comp_k.pex:
+                    self.log.warning(f"Correcting composition {old_comp_k} -> {new_k}")
+                    self.target_composition[new_k] = target
+                    del self.target_composition[old_comp_k]
                     break
 
-        for contract in pos_data.keys():
-            nc = NormedContract.normalize_contract(contract)
-            if nc not in self.price_watchers.values():
+        for sc in pos_data.keys():
+            if sc not in self.price_watchers.values():
                 req_id = self.PORTFOLIO_PRICE_REQ_ID + len(self.price_watchers)
-                self.log.info(f"Subscribing ({req_id=}) to prices for {nc.symbol}.")
-                self.price_watchers[req_id] = nc
-                self.reqRealTimeBars(req_id, nc, 60, "MIDPOINT", True, [])
+                self.log.info(f"Subscribing ({req_id=}) to prices for {sc.symbol}.")
+                self.price_watchers[req_id] = sc
+                self.reqRealTimeBars(req_id, sc.as_contract, 60, "MIDPOINT", True, [])
 
     @wrapper_override
     def realtimeBar(
@@ -228,15 +229,15 @@ class AutorebalanceApp(TWSApp):
         self, oid: int, contract: Contract, order: Order, order_state: OrderState
     ) -> None:
 
-        nc = self.order_manager.get_nc(oid)
-        if nc is None:
-            nc = NormedContract.normalize_contract(contract)
+        sc = self.order_manager.get_nc(oid)
+        if sc is None:
+            sc = SimpleContract.from_contract(contract)
             self.log.warning(
                 "Got open order for untracked instrument. "
                 "I assume this is a manual TWS order. I will track it."
             )
-            self.order_manager.enter_order(nc, oid, order)
-            self.order_manager.transmit_order(nc)
+            self.order_manager.enter_order(sc, oid, order)
+            self.order_manager.transmit_order(sc)
 
     @wrapper_override
     def orderStatus(
@@ -249,31 +250,33 @@ class AutorebalanceApp(TWSApp):
         *_: Any,
     ) -> None:
 
-        nc = self.order_manager.get_nc(oid)
-        assert nc is not None
-        order = self.order_manager.get_order(nc)
+        sc = self.order_manager.get_nc(oid)
+        assert sc is not None
+        order = self.order_manager.get_order(sc)
         assert order is not None
 
-        state = self.order_manager[nc]
+        state = self.order_manager[sc]
 
         if state == OMState.COOLOFF:
             self.log.info(f"Dropping post-finalization call for {oid=}")
             return
 
-        assert state == OMState.TRANSMITTED or self.order_manager.transmit_order(nc)
+        assert state == OMState.TRANSMITTED or self.order_manager.transmit_order(sc)
 
         if status == "Filled":
-            assert self.order_manager.finalize_order(nc)
-            self.log.info(f"Order for {pp_order(nc, order)} finalized.")
-            self.last_trade[nc] = Trade(
+            assert self.order_manager.finalize_order(sc)
+            self.log.info(f"Order for {pp_order(sc.as_contract, order)} finalized.")
+            self.last_trade[sc] = Trade(
                 time=datetime.utcnow(),
                 price=av_fill_px,
                 qty=(-1 if order.action == "SELL" else 1) * int(filled_qty),
-                sym=nc.symbol,
+                sym=sc.symbol,
             )
             self.reqPositions()
         else:
-            self.log.debug(f"Order status for {pp_order(nc, order)}: {status}")
+            self.log.debug(
+                f"Order status for {pp_order(sc.as_contract, order)}: {status}"
+            )
 
     @property
     def pricing_complete(self) -> bool:
@@ -328,7 +331,7 @@ class AutorebalanceApp(TWSApp):
             Policy.MARGIN_USAGE.block_level - 0.01,
         )
 
-    def construct_rebalance_orders(self) -> Dict[NormedContract, Order]:
+    def construct_rebalance_orders(self) -> Dict[SimpleContract, Order]:
 
         total_amt = 0.0
         orders = {}
@@ -348,18 +351,18 @@ class AutorebalanceApp(TWSApp):
 
         return orders
 
-    def clear_any_untransmitted_order(self, nc: NormedContract) -> None:
+    def clear_any_untransmitted_order(self, sc: SimpleContract) -> None:
 
         # will do nothing if the order is anything but an untransmitted entry
-        cleared_oid = self.order_manager.clear_untransmitted(nc)
+        cleared_oid = self.order_manager.clear_untransmitted(sc)
         if cleared_oid is not None:
             self.safe_cancel_order(cleared_oid)
 
-    def safe_place_order(self, nc: NormedContract, order: Order) -> None:
+    def safe_place_order(self, sc: SimpleContract, order: Order) -> None:
         """
         Should be invoked only from the rebalance thread, otherwise might deadlock.
 
-        :param nc: the contract for which to send the order.
+        :param sc: the contract for which to send the order.
         :param order: the Order object with order details.
         :return:
         """
@@ -370,18 +373,18 @@ class AutorebalanceApp(TWSApp):
         # no timeout -- reqIds -> .put is a deterministic cycle.
         oid = self.order_id_queue.get()
 
-        self.clear_any_untransmitted_order(nc)
+        self.clear_any_untransmitted_order(sc)
 
-        entered = self.order_manager.enter_order(nc, oid, order)
+        entered = self.order_manager.enter_order(sc, oid, order)
         if not entered:
-            state = self.order_manager.get_state(nc)
-            self.log.info(f"Order for {nc.symbol} rejected by manager: {state}.")
+            state = self.order_manager.get_state(sc)
+            self.log.info(f"Order for {sc.symbol} rejected by manager: {state}.")
             return
         # ^ DO NOT REORDER THESE CALLS v
-        self.placeOrder(oid, nc, order)
+        self.placeOrder(oid, sc.as_contract, order)
         self.log.info(
             color(
-                f"Placed order {pp_order(nc, order)}.",
+                f"Placed order {pp_order(sc.as_contract, order)}.",
                 "magenta" if not self.conf.armed else "red",
             )
         )

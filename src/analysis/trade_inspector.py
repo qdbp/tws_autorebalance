@@ -15,7 +15,8 @@ from typing import (
     MutableMapping,
     Container,
     Optional,
-    Collection)
+    Collection,
+)
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -307,7 +308,7 @@ def main() -> None:
         fig, ax = plt.subplots(1, 1)
         attr_set.plot_match(symbol, ax)
         ax.set_title(symbol)
-        fig.savefig(data_fn(f'{symbol}_tradeplot.png'))
+        fig.savefig(data_fn(f"{symbol}_tradeplot.png"))
 
     summarize_closed_positions()
 

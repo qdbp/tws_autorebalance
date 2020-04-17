@@ -5,11 +5,11 @@ from configparser import ConfigParser
 from dataclasses import dataclass
 from datetime import datetime, date
 from enum import Enum, auto
-from functools import total_ordering
+# noinspection PyUnresolvedReferences
+from functools import cached_property
 from logging import Logger
 from math import isclose
 from typing import (
-    Tuple,
     Dict,
     Optional,
     Iterable,
@@ -422,90 +422,71 @@ class AttributionSet:
         buys = np.array([pa.buy_price for pa in pas for _ in range(abs(pa.qty))])
         sells = np.array([pa.sell_price for pa in pas for _ in range(abs(pa.qty))])
 
-        ax.fill_between(range(len(buys)), buys, np.maximum(buys, sells), facecolor='green')
-        ax.fill_between(range(len(buys)), sells, np.maximum(buys, sells), facecolor='red')
-
-
-@total_ordering
-class NormedContract(Contract):
-    """
-    A STK Contract with simplified hashing and equality checking along with several
-    standardizations to make it suitable for use as a dictionary key.
-    """
-
-    def __eq__(self, other: object) -> bool:
-
-        if not isinstance(other, NormedContract):
-            raise ValueError()
-
-        return self.__hashtup == other.__hashtup
-
-    @property
-    def __hashtup(self) -> Tuple[str, ...]:
-        return (
-            self.currency,
-            self.symbol,
-            self.secType,
+        ax.fill_between(
+            range(len(buys)), buys, np.maximum(buys, sells), facecolor="green"
+        )
+        ax.fill_between(
+            range(len(buys)), sells, np.maximum(buys, sells), facecolor="red"
         )
 
-    def __hash__(self) -> int:
-        return self.__hashtup.__hash__()
 
-    def __lt__(self, other: NormedContract) -> bool:
-        return self.__hashtup < other.__hashtup
+@dataclass(frozen=True, order=True)
+class SimpleContract:
+
+    symbol: str
+    pex: str
 
     @classmethod
-    def normalize_contract(cls, contract: Contract) -> NormedContract:
+    def normalize_contract(cls, contract: Contract) -> Contract:
+        assert contract.primaryExchange != "SMART"
+        assert contract.secType == "STK"
+        assert contract.currency == "USD"
 
-        if contract.secType != "STK":
-            raise ValueError("Only STK contracts can be normalized.")
-
-        out = NormedContract()
-        out.symbol = contract.symbol
-        out.secType = contract.secType
-
-        # all contracts are reset to SMART
-        if contract.exchange != "SMART":
-            out.primaryExchange = contract.exchange
+        if contract.primaryExchange:
+            pex = contract.primaryExchange
         else:
-            out.primaryExchange = contract.primaryExchange
+            assert contract.exchange != "SMART"
+            pex = contract.exchange
 
+        return cls(symbol=contract.symbol, pex=pex).as_contract
+
+    @classmethod
+    def from_contract(cls, contract: Contract) -> SimpleContract:
+        contract = cls.normalize_contract(contract)
+        return cls(symbol=contract.symbol, pex=contract.primaryExchange)
+
+    @cached_property
+    def as_contract(self) -> Contract:
+        out = Contract()
+        out.symbol = self.symbol
+        out.secType = "STK"
+        out.currency = "USD"
         out.exchange = "SMART"
-        out.currency = contract.currency
-
-        # stupid hack -- TWS returns NASDAQ as the pex, but only accepts ISLAND
-        if out.primaryExchange == "NASDAQ":
+        if self.pex == "NASDAQ":
             out.primaryExchange = "ISLAND"
-
-        # SMART is not a valid pex
+        else:
+            out.primaryExchange = self.pex
         return out
 
-    @classmethod
-    def from_symbol_and_pex(cls, symbol: str, pex: str) -> NormedContract:
-        nc = NormedContract()
-        nc.symbol = symbol.upper()
-        nc.currency = "USD"
-        nc.secType = "STK"
-        nc.exchange = "SMART"
-        nc.primaryExchange = pex
-        return nc
+    def __str__(self) -> str:
+        return f"SimpleContract({self.symbol}/{self.pex})"
 
 
-class Composition(Dict[NormedContract, float]):
+class Composition(Dict[SimpleContract, float]):
     """
     A thin wrapper around a dictionary from contacts to floats that checks types and
     guarantees component portions sum to 100%.
     """
 
-    def __init__(self, d: Dict[NormedContract, float]):
+    def __init__(self, d: Dict[SimpleContract, float]):
         super().__init__(d)
 
     @classmethod
     def from_dict(
-        cls, d: Dict[NormedContract, float], do_normalize: bool = False
+        cls, d: Dict[SimpleContract, float], do_normalize: bool = False
     ) -> Composition:
         for k, v in d.items():
-            assert isinstance(k, NormedContract)
+            assert isinstance(k, SimpleContract)
             assert isinstance(v, float)
 
         total = sum(d.values())
@@ -537,7 +518,7 @@ class Composition(Dict[NormedContract, float]):
                 symbol = items[0]
                 _, pex = items[3].split("/")
 
-                nc = NormedContract.from_symbol_and_pex(symbol, pex)
+                nc = SimpleContract(symbol, pex)
                 out[nc] = float(items[-1])
 
         return cls.from_dict(out, do_normalize=True)
@@ -557,7 +538,7 @@ class Composition(Dict[NormedContract, float]):
 
             symbol = key.upper()
             pex, scomp = item.split(",")
-            nc = NormedContract.from_symbol_and_pex(symbol, pex)
+            nc = SimpleContract(symbol, pex)
             out[nc] = float(scomp)
 
         return cls.from_dict(out, do_normalize=True)
@@ -698,77 +679,77 @@ class OrderManager:
 
         self.log = log
 
-        self._nc_by_oid: Dict[int, NormedContract] = {}
-        self._oid_by_nc: Dict[NormedContract, int] = {}
-        self._orders: Dict[NormedContract, Order] = {}
-        self._order_state: Dict[NormedContract, OMState] = {}
-        self._cooloff_time: Dict[NormedContract, float] = {}
+        self._sc_by_oid: Dict[int, SimpleContract] = {}
+        self._oid_by_sc: Dict[SimpleContract, int] = {}
+        self._orders: Dict[SimpleContract, Order] = {}
+        self._order_state: Dict[SimpleContract, OMState] = {}
+        self._cooloff_time: Dict[SimpleContract, float] = {}
 
-    def _check_cooloff(self, nc: NormedContract) -> None:
+    def _check_cooloff(self, sc: SimpleContract) -> None:
         if (
-            self._order_state.get(nc) == OMState.COOLOFF
-            and time.time() - self._cooloff_time[nc] > sec.Policy.ORDER_COOLOFF
+            self._order_state.get(sc) == OMState.COOLOFF
+            and time.time() - self._cooloff_time[sc] > sec.Policy.ORDER_COOLOFF
         ):
-            oid = self._oid_by_nc[nc]
-            del self._nc_by_oid[oid]
-            del self._oid_by_nc[nc]
-            del self._orders[nc]
-            del self._order_state[nc]
-            del self._cooloff_time[nc]
+            oid = self._oid_by_sc[sc]
+            del self._sc_by_oid[oid]
+            del self._oid_by_sc[sc]
+            del self._orders[sc]
+            del self._order_state[sc]
+            del self._cooloff_time[sc]
 
-    def get_state(self, nc: NormedContract) -> OMState:
-        self._check_cooloff(nc)
-        return self._order_state.get(nc, OMState.UNKNOWN)
+    def get_state(self, sc: SimpleContract) -> OMState:
+        self._check_cooloff(sc)
+        return self._order_state.get(sc, OMState.UNKNOWN)
 
-    def enter_order(self, nc: NormedContract, oid: int, order: Order) -> bool:
-        if self.get_state(nc) != OMState.UNKNOWN:
+    def enter_order(self, sc: SimpleContract, oid: int, order: Order) -> bool:
+        if self.get_state(sc) != OMState.UNKNOWN:
             return False
-        self._nc_by_oid[oid] = nc
-        self._oid_by_nc[nc] = oid
-        self._orders[nc] = order
-        self._order_state[nc] = OMState.ENTERED
+        self._sc_by_oid[oid] = sc
+        self._oid_by_sc[sc] = oid
+        self._orders[sc] = order
+        self._order_state[sc] = OMState.ENTERED
         return True
 
-    def clear_untransmitted(self, nc: NormedContract) -> Optional[int]:
-        if self.get_state(nc) != OMState.ENTERED:
+    def clear_untransmitted(self, sc: SimpleContract) -> Optional[int]:
+        if self.get_state(sc) != OMState.ENTERED:
             return None
-        oid = self._oid_by_nc[nc]
-        del self._nc_by_oid[oid]
-        del self._oid_by_nc[nc]
-        del self._orders[nc]
-        del self._order_state[nc]
+        oid = self._oid_by_sc[sc]
+        del self._sc_by_oid[oid]
+        del self._oid_by_sc[sc]
+        del self._orders[sc]
+        del self._order_state[sc]
         return oid
 
-    def transmit_order(self, nc: NormedContract) -> bool:
-        if self.get_state(nc) != OMState.ENTERED:
+    def transmit_order(self, sc: SimpleContract) -> bool:
+        if self.get_state(sc) != OMState.ENTERED:
             return False
-        self._order_state[nc] = OMState.TRANSMITTED
+        self._order_state[sc] = OMState.TRANSMITTED
         return True
 
-    def finalize_order(self, nc: NormedContract) -> bool:
-        if self.get_state(nc) != OMState.TRANSMITTED:
+    def finalize_order(self, sc: SimpleContract) -> bool:
+        if self.get_state(sc) != OMState.TRANSMITTED:
             return False
-        self._cooloff_time[nc] = time.time()
-        self._order_state[nc] = OMState.COOLOFF
+        self._cooloff_time[sc] = time.time()
+        self._order_state[sc] = OMState.COOLOFF
         return True
 
-    def get_nc(self, oid: int) -> Optional[NormedContract]:
-        return self._nc_by_oid.get(oid)
+    def get_nc(self, oid: int) -> Optional[SimpleContract]:
+        return self._sc_by_oid.get(oid)
 
-    def get_oid(self, nc: NormedContract) -> Optional[int]:
-        return self._oid_by_nc.get(nc)
+    def get_oid(self, sc: SimpleContract) -> Optional[int]:
+        return self._oid_by_sc.get(sc)
 
-    def get_order(self, nc: NormedContract) -> Optional[Order]:
-        return self._orders.get(nc)
+    def get_order(self, sc: SimpleContract) -> Optional[Order]:
+        return self._orders.get(sc)
 
     def print_book(self) -> None:
-        for nc, state in self._order_state.items():
-            msg = f"Order Book: {nc.symbol} = {state}"
+        for sc, state in self._order_state.items():
+            msg = f"Order Book: {sc.symbol} = {state}"
             if state == OMState.ENTERED or state == OMState.TRANSMITTED:
-                order = self._orders[nc]
-                msg += f": {pp_order(nc, order)}"
+                order = self._orders[sc]
+                msg += f": {pp_order(sc.as_contract, order)}"
             # TODO should be debug once things are finalized
             self.log.info(msg)
 
-    def __getitem__(self, nc: NormedContract) -> OMState:
+    def __getitem__(self, nc: SimpleContract) -> OMState:
         return self.get_state(nc)

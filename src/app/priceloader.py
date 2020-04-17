@@ -17,7 +17,7 @@ from pytz import timezone, UTC
 from src import data_fn, config
 from src.app.base import TWSApp, wrapper_override
 from src.model.constants import ONE_DAY
-from src.model.data import OHLCBar, Composition, NormedContract
+from src.model.data import OHLCBar, Composition, SimpleContract
 from src.util.format import color
 
 TickType = Literal["mid", "bid", "ask", "trades"]
@@ -240,10 +240,10 @@ class PriceLoaderApp(TWSApp):
             )
 
     def load_price_data(
-        self, nc: NormedContract, interval: int, tick_type: TickType, day: date
+        self, sc: SimpleContract, interval: int, tick_type: TickType, day: date
     ) -> DataFrame:
 
-        sym = nc.symbol
+        sym = sc.symbol
 
         with self.db_conn as c:
             in_meta = c.execute(
@@ -256,7 +256,7 @@ class PriceLoaderApp(TWSApp):
 
         if not in_meta:
             self.log.info(
-                f"Requesting data for {nc.symbol} @ {day}, {tick_type}/{interval}"
+                f"Requesting data for {sc.symbol} @ {day}, {tick_type}/{interval}"
             )
 
             self._prices_loaded.clear()
@@ -273,7 +273,7 @@ class PriceLoaderApp(TWSApp):
 
             self.reqHistoricalData(
                 reqId=req_id,
-                contract=nc,
+                contract=sc.as_contract,
                 endDateTime=end_str,
                 # this is hardcoded since one-day blocks are fundamental to how we
                 # process price data
