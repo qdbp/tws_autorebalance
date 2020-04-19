@@ -397,6 +397,10 @@ class SimpleContract:
     symbol: str
     pex: str
 
+    def __post_init__(self) -> None:
+        assert self.pex and self.pex != "SMART"
+        assert self.symbol
+
     @classmethod
     def normalize_contract(cls, contract: Contract) -> Contract:
         assert contract.primaryExchange != "SMART"
