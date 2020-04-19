@@ -108,7 +108,7 @@ PAttrMode = Literal["max_loss", "max_gain", "min_variation", "longest", "shortes
 
 @lru_cache()
 def calculate_profit_attributions(
-    trades: Tuple[Trade], mode: PAttrMode = "min_variation",
+    trades: Tuple[Trade], mode: PAttrMode = "min_variation", minvar_gamma: float = 1.05,
 ) -> Tuple[List[ProfitAttribution], Optional[Position]]:
 
     """
@@ -128,7 +128,11 @@ def calculate_profit_attributions(
         shortes: minimizes the total time between opening and closing trades.
 
     Args:
+        trades: the list of trades to parse into attributions
         mode: the mode, as described above.
+        minvar_gamma: if the mode is min_variation, the price gap is actually raised
+            to this power (which should be just above 1) in the price matrix to force
+            the optimizer to minimize the average individual gaps as a quasi-subproblem.
 
     Returns:
         a tuple of:
@@ -160,7 +164,7 @@ def calculate_profit_attributions(
         elif mode == "max_gain":
             loss[bx, sx] = buy.price - sell.price
         elif mode == "min_variation":
-            loss[bx, sx] = abs(buy.price - sell.price)
+            loss[bx, sx] = abs(buy.price - sell.price) ** minvar_gamma
         elif mode == "longest":
             start = min(buy.time, sell.time)
             end = max(buy.time, sell.time)
