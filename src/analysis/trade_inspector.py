@@ -255,13 +255,14 @@ def analyze_trades(
 
         cur_date += delta
 
+    w_av_p = np.array(weighted_av_price)
+    w_av_p -= w_av_p.mean()
+    w_av_p *= 100 / w_av_p.std()
+
     fig, ax1, ax2 = plot_trade_profits(attr_set)
     ax1.plot(
-        all_dates,
-        weighted_av_price,
-        color="green",
-        lw=0.5,
-        label="weighted average price",
+        all_dates, w_av_p, color="orange", label="weighted average price (rescaled)",
+        lw=0.75,
     )
     ax2.plot(
         all_dates,
@@ -301,13 +302,12 @@ def main() -> None:
     symbols = {nc.symbol for nc in Composition.parse_ini_composition(config())}
 
     mode: PAttrMode
-    for mode in ["shortest", "min_variation"]:
+    for mode in ["min_variation"]:
         attr_set = analyze_trades(args.start, args.end, symbols, mode=mode)
 
     for symbol in symbols:
         fig, ax = plt.subplots(1, 1)
         attr_set.plot_match(symbol, ax)
-        ax.set_title(symbol)
         fig.savefig(data_fn(f"{symbol}_tradeplot.png"))
 
     summarize_closed_positions()

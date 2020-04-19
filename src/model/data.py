@@ -20,17 +20,13 @@ from typing import (
     ItemsView,
     KeysView,
     ValuesView,
-    Collection,
 )
 
 import numpy as np
-from cycler import cycler
 from ibapi.contract import Contract
 from ibapi.order import Order
-from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
-from matplotlib.figure import Figure
-from matplotlib.ticker import FixedLocator, MultipleLocator, FuncFormatter
+from matplotlib.ticker import MultipleLocator
 
 from src import security as sec
 from src.model.calc_primitives import sgn, get_loan_at_target_utilization
@@ -359,65 +355,17 @@ class AttributionSet:
     def pas_by_profit(self) -> List[ProfitAttribution]:
         return sorted(self.pas, key=lambda pa: pa.net_gain)
 
-    def plot_spans(self, only_symbols: Collection[str] = None) -> Figure:
-
-        fig: Figure = plt.figure()
-        ax: Axes = fig.subplots()
-
-        col_cyc = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-        cyc = (
-            cycler(lw=[2.0, 3.0])
-            * cycler(linestyle=["-", ":", "--", "-."])
-            * cycler(color=col_cyc)
-        )
-
-        include_symbols = self.all_symbols & (
-            self.all_symbols if only_symbols is None else only_symbols
-        )
-
-        styles = list(cyc)
-        ixes = {sym: ix for ix, sym in enumerate(sorted(include_symbols))}
-        have_labelled = set()
-
-        for pa in self.pas:
-            sym = pa.sym
-            if sym not in include_symbols:
-                continue
-
-            if sym in have_labelled:
-                label = None
-            else:
-                label = sym
-                have_labelled.add(sym)
-
-            ax.plot(
-                [pa.start_time, pa.end_time],
-                [pl := (sgn(pa.net_gain) * np.log10(abs(pa.net_gain))), pl],
-                **styles[ixes[sym]],
-                label=label,
-            )
-
-        ax.legend()
-        ax.set_title("Day Trades Profit-Span Plot")
-        ax.set_ylabel("LOG Profit/Loss (only height matters, not area under curve!)")
-        ax.set_xlabel("Open/Close dates of trades.")
-        ax.grid(which="major")
-        ax.yaxis.set_major_locator(FixedLocator([0.0]))
-        ax.yaxis.set_minor_locator(MultipleLocator(0.5))
-        ax.yaxis.set_major_formatter(
-            FuncFormatter(lambda x, _: f"{sgn(x) * 10 ** abs(x):.1f}")
-        )
-        ax.yaxis.set_minor_formatter(ax.yaxis.get_major_formatter())
-        ax.xaxis.set_minor_locator(MultipleLocator(1))
-        ax.grid(axis="y", which="major", lw=3.0, color="k")
-        ax.grid(which="minor", lw=0.25)
-        fig.set_size_inches((12, 8))
-        return fig
-
-    def plot_match(self, symbol: str, ax: Axes, **plot_kwargs) -> None:
+    def plot_match(
+        self, symbol: str, ax: Axes, by: Literal["time", "price"] = "price"
+    ) -> None:
 
         pas = sorted(
-            [pa for pa in self.pas if pa.sym == symbol], key=lambda x: x.buy_price
+            [pa for pa in self.pas if pa.sym == symbol],
+            key=(
+                (lambda x: x.open_trade.time)
+                if by == "time"
+                else (lambda x: x.open_trade.buy_price)
+            ),
         )
         buys = np.array([pa.buy_price for pa in pas for _ in range(abs(pa.qty))])
         sells = np.array([pa.sell_price for pa in pas for _ in range(abs(pa.qty))])
@@ -427,6 +375,19 @@ class AttributionSet:
         )
         ax.fill_between(
             range(len(buys)), sells, np.maximum(buys, sells), facecolor="red"
+        )
+
+        ax.set_xlabel("Trade index, by individual shares")
+        ax.set_ylabel("Sold/Bought price")
+        ax.set_ylim(1, round(max(sells), -1) + 20)
+        ax.yaxis.set_major_locator(MultipleLocator(10))
+        ax.yaxis.set_minor_locator(MultipleLocator(2.5))
+        ax.grid()
+        total_gain = (sells - np.minimum(sells, buys)).sum()
+        total_loss = (sells - np.maximum(sells, buys)).sum()
+        net = total_gain + total_loss
+        ax.set_title(
+            f"{symbol} profits: {total_gain:.0f} - {-total_loss:.0f} = {net:.0f}"
         )
 
 
