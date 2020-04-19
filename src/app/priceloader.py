@@ -336,7 +336,7 @@ if __name__ == "__main__":
     tick_type: TickType
 
     app = PriceLoaderApp("prices.db")
-    for nc in target_composition.keys():
+    for nc in target_composition.contracts:
         for date in bdate_range("2020-03-17", "2020-04-15"):
             for tick_type in ["mid", "bid", "ask"]:
                 out = app.load_price_data(nc, 60, tick_type, date)

@@ -120,7 +120,7 @@ class AutorebalanceApp(TWSApp):
         # market config
         self.target_composition = Composition.parse_ini_composition(config())
         self.log.info("Loaded target composition:")
-        for k, v in self.target_composition.items():
+        for k, v in self.target_composition.items:
             self.log.info(f"{k} <- {v * 100:.2f}%")
 
         self.conf: AutorebalanceConfig = AutorebalanceConfig.read_config(config())
@@ -199,13 +199,17 @@ class AutorebalanceApp(TWSApp):
             self.portfolio.update(pos_data)
 
         # correct bad primary exchanges in our composition
-        for new_k in self.portfolio.keys():
-            for old_comp_k, target in set(self.target_composition.items()):
-                if new_k.symbol == old_comp_k.symbol and new_k.pex != old_comp_k.pex:
-                    self.log.warning(f"Correcting composition {old_comp_k} -> {new_k}")
-                    self.target_composition[new_k] = target
-                    del self.target_composition[old_comp_k]
-                    break
+        new_composition: Dict[SimpleContract, float] = {}
+        for old_comp_k, target in set(self.target_composition.items):
+            new_key = old_comp_k
+            for port_key in self.portfolio.keys():
+                if port_key.symbol != old_comp_k.symbol:
+                    continue
+                if port_key.pex != old_comp_k.pex:
+                    self.log.warning(f"Correcting composition {old_comp_k} -> {port_key}")
+                    new_key = port_key
+            new_composition[new_key] = target
+        self.target_composition = Composition.from_dict(new_composition)
 
         for sc in pos_data.keys():
             if sc not in self.price_watchers.values():
@@ -317,8 +321,8 @@ class AutorebalanceApp(TWSApp):
     def effective_drawdown(self) -> float:
         self.wait_until_live()
         port_price = sum(
-            self.target_composition[nc] * self.portfolio_prices[nc].c
-            for nc in self.target_composition.keys()
+            self.target_composition[sc] * self.portfolio_prices[sc].c
+            for sc in self.target_composition.contracts
         )
         out = 1 - port_price / self.conf.dd_reference_ath
         assert 0 <= out < 1
@@ -423,10 +427,10 @@ class AutorebalanceApp(TWSApp):
 
             ideal_allocation_delta: Dict[str, Tuple[int, float, float]] = {}
 
-            for nc in self.target_composition.keys():
-                target_alloc = model_alloc[nc]
-                cur_alloc = self.portfolio[nc]
-                price = close_prices[nc]
+            for sc in self.target_composition.contracts:
+                target_alloc = model_alloc[sc]
+                cur_alloc = self.portfolio[sc]
+                price = close_prices[sc]
 
                 if check_if_needs_rebalance(
                     price,
@@ -437,13 +441,13 @@ class AutorebalanceApp(TWSApp):
                     misalloc_frac_elbow=self.conf.misalloc_frac_force_elbow,
                     misalloc_frac_coef=self.conf.misalloc_frac_force_coef,
                 ):
-                    self.rebalance_target[nc] = target_alloc - cur_alloc
+                    self.rebalance_target[sc] = target_alloc - cur_alloc
                 else:
-                    self.rebalance_target.pop(nc, None)
-                    self.clear_any_untransmitted_order(nc)
+                    self.rebalance_target.pop(sc, None)
+                    self.clear_any_untransmitted_order(sc)
 
                 if target_alloc != cur_alloc:
-                    ideal_allocation_delta[nc.symbol] = (
+                    ideal_allocation_delta[sc.symbol] = (
                         delta := (target_alloc - cur_alloc),
                         abs(delta) * price,
                         max(1 - target_alloc / cur_alloc, 1 - cur_alloc / target_alloc),
@@ -468,8 +472,8 @@ class AutorebalanceApp(TWSApp):
                         f"{ {k.symbol: v for k, v in self.rebalance_target.items()} }."
                     )
                 )
-                for nc, order in self.construct_rebalance_orders().items():
-                    self.safe_place_order(nc, order)
+                for sc, order in self.construct_rebalance_orders().items():
+                    self.safe_place_order(sc, order)
                 self.order_manager.print_book()
                 self.notify_desktop(rebalance_msg)
 
@@ -516,8 +520,8 @@ class AutorebalanceApp(TWSApp):
         raise SecurityFault(msg)
 
     def shut_down(self) -> None:
-        for nc in self.target_composition.keys():
-            self.clear_any_untransmitted_order(nc)
+        for sc in self.target_composition.contracts:
+            self.clear_any_untransmitted_order(sc)
         self.workers_halt.set()
         super().shut_down()
 

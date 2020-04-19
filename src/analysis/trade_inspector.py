@@ -259,9 +259,13 @@ def analyze_trades(
     w_av_p -= w_av_p.mean()
     w_av_p *= 100 / w_av_p.std()
 
+    # noinspection PyUnboundLocalVariable
     fig, ax1, ax2 = plot_trade_profits(attr_set)
     ax1.plot(
-        all_dates, w_av_p, color="orange", label="weighted average price (rescaled)",
+        all_dates,
+        w_av_p,
+        color="orange",
+        label="weighted average price (rescaled)",
         lw=0.75,
     )
     ax2.plot(
@@ -299,7 +303,9 @@ def summarize_closed_positions() -> None:
 def main() -> None:
     args = get_args()
 
-    symbols = {nc.symbol for nc in Composition.parse_ini_composition(config())}
+    symbols = {
+        sc.symbol for sc in Composition.parse_ini_composition(config()).contracts
+    }
 
     mode: PAttrMode
     for mode in ["min_variation"]:

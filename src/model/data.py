@@ -8,7 +8,7 @@ from enum import Enum, auto
 # noinspection PyUnresolvedReferences
 from functools import cached_property
 from logging import Logger
-from math import isclose
+from types import MappingProxyType
 from typing import (
     Dict,
     Optional,
@@ -437,32 +437,34 @@ class SimpleContract:
         return f"SimpleContract({self.symbol}/{self.pex})"
 
 
-class Composition(Dict[SimpleContract, float]):
+@dataclass(frozen=True)
+class Composition:
     """
     A thin wrapper around a dictionary from contacts to floats that checks types and
     guarantees component portions sum to 100%.
     """
 
-    def __init__(self, d: Dict[SimpleContract, float]):
-        super().__init__(d)
+    _composition: MappingProxyType
+
+    def __post_init__(self) -> None:
+        total = 0.0
+        for k, v in self._composition.items():
+            assert isinstance(k, SimpleContract)
+            assert isinstance(v, float)
+            total += v
+        assert np.isclose(total, 1.0)
 
     @classmethod
     def from_dict(
         cls, d: Dict[SimpleContract, float], do_normalize: bool = False
     ) -> Composition:
-        for k, v in d.items():
-            assert isinstance(k, SimpleContract)
-            assert isinstance(v, float)
 
         total = sum(d.values())
         if do_normalize:
             for k in d.keys():
                 d[k] /= total
 
-        elif not isclose(total, 1.0):
-            raise ValueError
-
-        return cls(d)
+        return cls(_composition=MappingProxyType(d))
 
     @classmethod
     def parse_tws_composition(cls, fn: str) -> Composition:
@@ -507,6 +509,22 @@ class Composition(Dict[SimpleContract, float]):
             out[nc] = float(scomp)
 
         return cls.from_dict(out, do_normalize=True)
+
+    def __getitem__(self, sc: SimpleContract) -> float:
+        return self._composition[sc]
+
+    def __len__(self) -> int:
+        return len(self._composition)
+
+    @property
+    def contracts(self) -> KeysView[SimpleContract]:
+        # noinspection PyTypeChecker
+        return self._composition.keys()
+
+    @property
+    def items(self) -> ItemsView[SimpleContract, float]:
+        # noinspection PyTypeChecker
+        return self._composition.items()
 
 
 class AcctState:

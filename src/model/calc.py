@@ -35,7 +35,7 @@ def find_closest_portfolio(
 
     # will raise if a price is missing
     comp_arr, price_arr = np.array(
-        [[composition[c], prices[c]] for c in composition.keys()]
+        [[composition[c], prices[c]] for c in composition.contracts]
     ).T
 
     assert np.isclose(comp_arr.sum(), 1.0)
@@ -73,7 +73,7 @@ def find_closest_portfolio(
     normed_misalloc = loss.value() / funds
     sec.Policy.MISALLOCATION.validate(normed_misalloc)
 
-    return {c: int(v) for c, v in zip(composition.keys(), alloc.values)}
+    return {c: int(v) for c, v in zip(composition.contracts, alloc.values)}
 
 
 def check_if_needs_rebalance(
