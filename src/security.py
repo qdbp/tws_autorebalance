@@ -191,7 +191,7 @@ class Policy:
     )
     ORDER_QTY = ThreeTierNMax("ORDER SIZE", 250, 100, 50, "Large order size.")
     ORDER_TOTAL = ThreeTierNMax(
-        "ORDER TOTAL", 10000.0, 2500.0, 1000.0, "Large order amount."
+        "ORDER TOTAL", 50000.0, 5000.0, 1000.0, "Large order amount."
     )
     MISALLOC_DOLLARS = ThreeTierNMin(
         "MISALLOC $ MIN", 200, 400, 600, "Small dollar rebalance threshold."
@@ -210,7 +210,7 @@ class Policy:
     ORDER_COOLOFF = 60
 
     MAX_PRICING_AGE = 20  # seconds
-    MAX_ACCT_SUM_AGE = 20  # seconds
+    MAX_ACCT_SUM_AGE = 120  # seconds
 
 
 def audit_order(order: Order) -> Order:
