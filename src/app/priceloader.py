@@ -1,6 +1,7 @@
-from datetime import date, time, datetime
+from datetime import date, time, datetime, timedelta
 from sqlite3 import Connection, connect
 from threading import Event
+from time import sleep
 from types import MappingProxyType
 from typing import Literal, get_args as get_type_args, Iterable
 
@@ -24,6 +25,9 @@ TickType = Literal["mid", "bid", "ask", "trades"]
 
 TWS_END_DATE_FMT = "%Y%m%d %H:%M:%S EST"
 
+MARKET_CLOSE = time(hour=16)
+MARKET_OPEN = time(hour=9, minute=30)
+
 
 VALID_INTERVALS = MappingProxyType(
     {
@@ -42,6 +46,10 @@ VALID_INTERVALS = MappingProxyType(
     }
 )
 
+# maximum length of span (value) allowed for interval (key) when loading data
+# only includes values allowing less than a full day.
+MAX_SPANS = MappingProxyType({1: 1800, 5: 3600, 10: 14400, 30: 28800,})
+
 
 def validate_interval(interval: int) -> None:
     assert interval in VALID_INTERVALS
@@ -53,6 +61,10 @@ class PriceLoaderApp(TWSApp):
 
     META_DATE_FMT = "%Y%m%d"
     META_TABLE_NAME = "prices_meta"
+
+    REQ_ID_ONESHOT = 1
+    REQ_ID_MULTI = 2
+    REQ_ID_MULTI_END = 3
 
     @staticmethod
     def get_table_name(symbol: str, interval: int, typ: TickType) -> str:
@@ -84,6 +96,7 @@ class PriceLoaderApp(TWSApp):
         self.create_meta_table()
 
         self._prices_loaded = Event()
+        self._prices_part_loaded = Event()
         self._prices_buffer = []
 
     @property
@@ -149,6 +162,7 @@ class PriceLoaderApp(TWSApp):
         to the database to indicate that the complete data is present.
 
         Args:
+            requested_day: the day for which the ticks are being requested.
             sym: the symbol to associate to the ticks
             interval: the timing interval of the ticks. Will be used to check
                 regularity.
@@ -175,6 +189,15 @@ class PriceLoaderApp(TWSApp):
 
         sorted_ticks = sorted(ticks)
         assert sorted_ticks
+
+        # sometimes we have parts of the previous day's data in the buffer: we
+        # ignore it
+        ix = 0
+        for ix in range(len(sorted_ticks)):
+            if datetime.fromtimestamp(sorted_ticks[ix].t).date() < requested_day:
+                continue
+            break
+        sorted_ticks = sorted_ticks[ix:]
 
         first_dtt = datetime.fromtimestamp(sorted_ticks[0].t, tz=UTC).astimezone(
             self.tz
@@ -258,45 +281,79 @@ class PriceLoaderApp(TWSApp):
             self.log.info(
                 f"Requesting data for {sc.symbol} @ {day}, {tick_type}/{interval}"
             )
-
             self._prices_loaded.clear()
+            self._prices_part_loaded.clear()
             self._prices_buffer.clear()
 
             if tick_type == "mid":
                 to_show = "MIDPOINT"
             else:
                 to_show = tick_type.upper()
+            # this means we can ingest the data in one go
+            if interval not in MAX_SPANS:
+                # we never have multiple requests in flight, so duplicates are fine
+                req_id = 1
+                end_str = (day + ONE_DAY).strftime(TWS_END_DATE_FMT)
+                self.reqHistoricalData(
+                    reqId=req_id,
+                    contract=sc.as_contract,
+                    endDateTime=end_str,
+                    # this is hardcoded since one-day blocks are fundamental to how we
+                    # process price data
+                    durationStr="1 D",
+                    barSizeSetting=VALID_INTERVALS[interval],
+                    whatToShow=to_show,
+                    useRTH=True,
+                    keepUpToDate=False,
+                    # 1 = string format; 2 = unix seconds int
+                    formatDate=2,
+                    # TWS requires this...
+                    chartOptions=[],
+                )
+            else:
+                delta = timedelta(seconds=MAX_SPANS[interval])
+                cur_time = datetime.combine(day, MARKET_CLOSE)
+                open_time = datetime.combine(day, MARKET_OPEN)
+                while cur_time > open_time:
+                    next_time = cur_time - delta
+                    if next_time > open_time:
+                        req_id = self.REQ_ID_MULTI
+                    else:
+                        req_id = self.REQ_ID_MULTI_END
+                    end_str = cur_time.strftime(TWS_END_DATE_FMT)
+                    bar_size = VALID_INTERVALS[interval]
+                    self.log.info(f"Requesting {sym} {end_str} <- {bar_size}.")
+                    self._prices_part_loaded.clear()
+                    self.reqHistoricalData(
+                        reqId=req_id,
+                        contract=sc.as_contract,
+                        endDateTime=end_str,
+                        durationStr=f"{delta.seconds} S",
+                        barSizeSetting=bar_size,
+                        whatToShow=to_show,
+                        useRTH=True,
+                        keepUpToDate=False,
+                        formatDate=2,
+                        chartOptions=[],
+                    )
+                    # for TWS pacing violations
+                    sleep(10.1)
+                    self._prices_part_loaded.wait()
+                    cur_time -= delta
 
-            # we never have multiple requests in flight, so duplicates are fine
-            req_id = int(day.strftime("%Y%m%d"))
-            end_str = (day + ONE_DAY).strftime(TWS_END_DATE_FMT)
-
-            self.reqHistoricalData(
-                reqId=req_id,
-                contract=sc.as_contract,
-                endDateTime=end_str,
-                # this is hardcoded since one-day blocks are fundamental to how we
-                # process price data
-                durationStr="1 D",
-                barSizeSetting=VALID_INTERVALS[interval],
-                whatToShow=to_show,
-                useRTH=True,
-                keepUpToDate=False,
-                # 1 = string format; 2 = unix seconds int
-                formatDate=2,
-                # TWS requires this...
-                chartOptions=[],
-            )
             self._prices_loaded.wait()
-            self.store_price_tickers(
-                sym, interval, tick_type, self._prices_buffer, requested_day=day
-            )
+            try:
+                self.store_price_tickers(
+                    sym, interval, tick_type, self._prices_buffer, requested_day=day
+                )
+            except ValueError as e:
+                self.log.error(f"Failed to store data for {sym} @ {day}/{interval}")
+                self.log.error(e)
 
         # we get data for the entire day, ignoring market open/close times,
         # the correct handling of which is assured by store_price_tickers
         start = datetime.combine(day, time()).astimezone(self.tz).timestamp()
         end = datetime.combine(day + ONE_DAY, time()).astimezone(self.tz).timestamp()
-
         # noinspection SqlResolve
         out = read_sql(
             f"""
@@ -306,7 +363,6 @@ class PriceLoaderApp(TWSApp):
             self.db_conn,
             index_col="usecs",
         )
-
         # noinspection PyTypeChecker
         # bad to_datetime inferred return type
         index: DatetimeIndex = to_datetime(out.index, unit="s", utc=True)
@@ -323,8 +379,17 @@ class PriceLoaderApp(TWSApp):
 
     @wrapper_override
     def historicalDataEnd(self, req_id: int, start: str, end: str) -> None:
-        self.log.info(f"Received historical dataset, {len(self._prices_buffer)} bars.")
-        self._prices_loaded.set()
+        if req_id == self.REQ_ID_ONESHOT or self.REQ_ID_MULTI_END:
+            self.log.info(
+                f"Received part-day bar data, {len(self._prices_buffer)} bars."
+            )
+            self._prices_part_loaded.set()
+            self._prices_loaded.set()
+        else:
+            self.log.info(
+                f"Received all/rest of bar data, {len(self._prices_buffer)} bars."
+            )
+            self._prices_part_loaded.set()
 
     def error(self, req_id: int, code: int, msg: str):
         self.log.error(f"TWS error {req_id} -> {code} -> {msg}")
@@ -338,6 +403,6 @@ if __name__ == "__main__":
     app = PriceLoaderApp("prices.db")
     for nc in target_composition.contracts:
         for date in bdate_range("2020-03-17", "2020-04-15"):
-            for tick_type in ["mid", "bid", "ask"]:
-                out = app.load_price_data(nc, 60, tick_type, date)
+            for tick_type in ["mid"]:
+                out = app.load_price_data(nc, 5, tick_type, date)
     app.shut_down()

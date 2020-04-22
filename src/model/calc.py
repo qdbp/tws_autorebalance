@@ -5,18 +5,23 @@ from typing import Dict, List, Tuple, Literal, Optional
 
 import numpy as np
 import pulp
-from ibapi.contract import Contract
 from pulp import LpInteger, LpProblem, LpMinimize, COIN, LpStatus
 from pulp_lparray import lparray
 
 from src import security as sec
 from src.model.calc_primitives import shrink
-from src.model.data import Composition, Trade, ProfitAttribution, Position
+from src.model.data import (
+    Composition,
+    Trade,
+    ProfitAttribution,
+    Position,
+    SimpleContract,
+)
 
 
 def find_closest_portfolio(
-    funds: float, composition: Composition, prices: Dict[Contract, float],
-) -> Dict[Contract, int]:
+    funds: float, composition: Composition, prices: Dict[SimpleContract, float],
+) -> Dict[SimpleContract, int]:
     """
     Constructs the most closely-matching concrete, integral-share Portfolio matching
     this Allocation.
@@ -43,7 +48,7 @@ def find_closest_portfolio(
 
     target_alloc = funds * comp_arr / price_arr
 
-    prob = pulp.LpProblem(sense=pulp.LpMinimize)
+    prob = pulp.LpProblem()
 
     alloc = lparray.create_anon("Alloc", shape=comp_arr.shape, cat=pulp.LpInteger)
 
