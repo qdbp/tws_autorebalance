@@ -551,12 +551,15 @@ class AutorebalanceApp(TWSApp):
 def arb_entrypoint() -> None:
     while True:
         now = datetime.now()
-        if not time(hour=9, minute=29, second=30) <= now.time() <= time(
-            hour=16, minute=0, second=0
+        if not (
+            time(hour=9, minute=29, second=30)
+            <= now.time()
+            <= time(hour=16, minute=0, second=0)
         ) or now.date().weekday() in (5, 6):
             sleep(30)
+            continue
+
         try:
-            app = AutorebalanceApp()
-            app.execute()
+            AutorebalanceApp().execute()
         finally:
             continue

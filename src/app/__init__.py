@@ -1,4 +1,4 @@
-from .autorebalance import AutorebalanceApp
+from .autorebalance import AutorebalanceApp, arb_entrypoint
 
 
-__all__ = ["AutorebalanceApp"]
+__all__ = ["AutorebalanceApp", "arb_entrypoint"]

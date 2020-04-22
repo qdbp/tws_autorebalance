@@ -1,9 +1,8 @@
-from src.app import AutorebalanceApp
+from src.app import arb_entrypoint
 
 
 def main() -> None:
-    app = AutorebalanceApp()
-    app.execute()
+    arb_entrypoint()
 
 
 if __name__ == "__main__":
