@@ -165,7 +165,7 @@ def plot_trade_profits(
 
     ax1: Axes
     ax2: Axes
-    fig, (ax1, ax2) = plt.subplots(2, 1)
+    fig, (ax1, ax2) = plt.subplots(nrows=2)
 
     # date locators
     for ax in (ax1, ax2):
@@ -211,14 +211,12 @@ def analyze_trades(
     all_trades = load_tradelogs(start, end)
 
     all_dates = []
+
     tot_cash = []
     tot_basis = []
     weighted_av_price = []
 
-    delta = ONE_DAY
-    cur_date = start + delta
-
-    while cur_date <= end:
+    for cur_date in pd.bdate_range(start + ONE_DAY, end + ONE_DAY):
         all_dates.append(cur_date)
         tot_cash.append(0.0)
         tot_basis.append(0.0)
@@ -231,7 +229,7 @@ def analyze_trades(
             if sym in symbols
         }
 
-        tot_qty = 0
+        tot_basis_x_price = 0
         attr_set = AttributionSet()
         for sym, (pas, pos) in attributed.items():
             if pos is None:
@@ -240,7 +238,7 @@ def analyze_trades(
             else:
                 basis = pos.basis
                 pos_cash = pos.credit
-                tot_qty += pos.qty
+                tot_basis_x_price += pos.av_price * basis
 
             attr_set.extend(pas)
             cash = pos_cash + attr_set.net_gain_for_symbol(sym)
@@ -248,22 +246,18 @@ def analyze_trades(
             tot_cash[-1] += cash
             tot_basis[-1] += basis
 
-        if tot_qty > 0:
-            weighted_av_price.append(tot_basis[-1] / tot_qty)
+        if tot_basis[-1] > 0:
+            weighted_av_price.append(tot_basis_x_price / tot_basis[-1])
         else:
             weighted_av_price.append(0.0)
 
-        cur_date += delta
-
     w_av_p = np.array(weighted_av_price)
-    w_av_p -= w_av_p.mean()
-    w_av_p *= 100 / w_av_p.std()
 
     # noinspection PyUnboundLocalVariable
     fig, ax1, ax2 = plot_trade_profits(attr_set)
     ax1.plot(
         all_dates,
-        w_av_p,
+        (w_av_p - 125) * 4,
         color="orange",
         label="weighted average price (rescaled)",
         lw=0.75,
@@ -275,7 +269,7 @@ def analyze_trades(
         label="cumulative profit (marching)",
     )
     ax2.legend()
-    ax1.set_title(f"Profits from {start.date()} to {cur_date.date()}, method='{mode}'")
+    ax1.set_title(f"Profits from {start.date()} to {end.date()}, method='{mode}'")
     ax1.legend()
     ax1.set_ylim(*ylim1)
     ax1.set_xlim(*ax2.get_xlim())
@@ -308,7 +302,7 @@ def main() -> None:
     }
 
     mode: PAttrMode
-    for mode in ["min_variation"]:
+    for mode in ["shortest", "min_variation"]:
         attr_set = analyze_trades(args.start, args.end, symbols, mode=mode)
 
     for symbol in symbols:
