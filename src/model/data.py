@@ -43,6 +43,12 @@ class OHLCBar:
     l: float
     c: float
 
+    def __str__(self) -> str:
+        return (
+            f"OHLCBar({datetime.fromtimestamp(self.t)}: "
+            f"{self.o:.2f}/{self.h:.2f}/{self.l:.2f}/{self.c:.2f}"
+        )
+
 
 @dataclass(frozen=True, order=True)
 class Trade:
@@ -435,6 +441,8 @@ class SimpleContract:
 
     def __str__(self) -> str:
         return f"SimpleContract({self.symbol}/{self.pex})"
+
+    __repr__ = __str__
 
 
 @dataclass(frozen=True)
