@@ -370,7 +370,7 @@ class AttributionSet:
             key=(
                 (lambda x: x.open_trade.time)
                 if by == "time"
-                else (lambda x: x.open_trade.buy_price)
+                else (lambda x: x.open_trade.price)
             ),
         )
         buys = np.array([pa.buy_price for pa in pas for _ in range(abs(pa.qty))])
