@@ -293,6 +293,20 @@ class ProfitAttribution:
         return self.open_trade.qty < 0
 
     @property
+    def buy_trade(self) -> Trade:
+        if self.is_long:
+            return self.open_trade
+        else:
+            return self.close_trade
+
+    @property
+    def sell_trade(self) -> Trade:
+        if self.is_long:
+            return self.close_trade
+        else:
+            return self.open_trade
+
+    @property
     def buy_price(self) -> float:
         if self.is_long:
             return self.open_trade.price
@@ -370,7 +384,7 @@ class AttributionSet:
             key=(
                 (lambda x: x.open_trade.time)
                 if by == "time"
-                else (lambda x: x.open_trade.price)
+                else (lambda x: x.buy_price)
             ),
         )
         buys = np.array([pa.buy_price for pa in pas for _ in range(abs(pa.qty))])
@@ -395,6 +409,86 @@ class AttributionSet:
         ax.set_title(
             f"{symbol} profits: {total_gain:.0f} - {-total_loss:.0f} = {net:.0f}"
         )
+
+    def plot_arrows(self, symbol: str, ax: Axes) -> None:
+
+        pa: ProfitAttribution
+        pas = sorted(
+            [pa for pa in self.pas if pa.sym == symbol],
+            key=lambda pa: pa.open_trade.time,
+        )
+
+        ax.plot(
+            [date2num(pa.buy_trade.time) for pa in pas],
+            [pa.buy_trade.price for pa in pas],
+            color="k",
+            marker="^",
+            lw=0,
+            markersize=5,
+            zorder=1,
+        )
+        ax.plot(
+            [date2num(pa.sell_trade.time) for pa in pas],
+            [pa.sell_trade.price for pa in pas],
+            color="k",
+            marker="v",
+            lw=0,
+            markersize=5,
+            zorder=1,
+        )
+
+        max_mass = max([abs(pa.net_gain) for pa in pas])
+
+        for pa in pas:
+            x = date2num(pa.open_trade.time)
+            dx = date2num(pa.close_trade.time) - x
+
+            y = pa.open_trade.price
+            dy = pa.close_trade.price - y
+
+            if pa.net_gain > 0:
+                color = "green"
+            else:
+                color = "red"
+
+            ax.arrow(
+                *(x, y, dx, dy),
+                width=(w := max(0.2, 0.8 * pa.net_gain / max_mass)),
+                head_width=w,
+                head_length=0.5,
+                ec="k",
+                fc=color,
+                lw=0.5,
+                length_includes_head=True,
+                zorder=-w,
+            )
+
+        ax.figure.autofmt_xdate()
+
+        lbx = min([pa.start_time for pa in pas]) - ONE_DAY
+        ubx = max([pa.end_time for pa in pas]) + ONE_DAY
+        ax.set_xlim(lbx, ubx)
+
+        lby = max(min([min(pa.buy_price, pa.sell_price) for pa in pas]) - 10.0, 0)
+        uby = max([max(pa.buy_price, pa.sell_price) for pa in pas]) + 10.0
+        ax.set_ylim(lby, uby)
+
+        ax.set_xlabel("Trade date")
+        ax.set_ylabel("Trade price")
+
+        buys = np.array([pa.buy_price for pa in pas for _ in range(abs(pa.qty))])
+        sells = np.array([pa.sell_price for pa in pas for _ in range(abs(pa.qty))])
+        total_gain = (sells - np.minimum(sells, buys)).sum()
+        total_loss = (sells - np.maximum(sells, buys)).sum()
+        ax.set_title(
+            f"{symbol} profits: {total_gain:.0f} - {-total_loss:.0f} = "
+            f"{total_gain + total_loss:.0f}"
+        )
+        ax.xaxis.set_major_locator(WeekdayLocator())
+        ax.xaxis.set_minor_locator(MultipleLocator(1))
+        ax.xaxis.set_minor_formatter(DateFormatter("%d"))
+        ax.grid(color="#808080", lw=0.5)
+        ax.grid(color="#808080", lw=0.25, axis="x", which="minor")
 
 
 @dataclass(frozen=True, order=True)

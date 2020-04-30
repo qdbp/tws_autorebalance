@@ -111,7 +111,7 @@ def load_tradelogs(
 
     tws_log_today = Path(config()["trade_log"]["tws_log_dir"]).joinpath(
         f'trades.{date.today().strftime("%Y%m%d")}.csv'
-    )
+    ).expanduser()
 
     if tws_log_today.exists():
         for k, trades in parse_tws_exported_tradelog(tws_log_today).items():
@@ -204,8 +204,8 @@ def analyze_trades(
     symbols: Collection[str],
     *,
     mode: PAttrMode = "min_variation",
-    ylim1: Tuple[int, int] = (-100, 300),
-    ylim2: Tuple[int, int] = (-2000, 4000),
+    ylim1: Tuple[int, int] = (-100, 250),
+    ylim2: Tuple[int, int] = (-2000, 5000),
 ) -> AttributionSet:
 
     all_trades = load_tradelogs(start, end)
@@ -294,6 +294,21 @@ def summarize_closed_positions() -> None:
     print(portfolio)
 
 
+def get_attr_set_from_trades(
+    all_trades: Dict[str, List[Trade]], symbols: Set[str] = None
+) -> AttributionSet:
+
+    all_pas = {
+        sym: calculate_profit_attributions(tuple(trades), mode="shortest")
+        for sym, trades in all_trades.items()
+        if symbols is None or sym in symbols
+    }
+    attr_set = AttributionSet()
+    for sym, (pas, _) in all_pas.items():
+        attr_set.extend(pas)
+    return attr_set
+
+
 def main() -> None:
     args = get_args()
 
@@ -305,12 +320,19 @@ def main() -> None:
     for mode in ["shortest", "min_variation"]:
         attr_set = analyze_trades(args.start, args.end, symbols, mode=mode)
 
-    for symbol in symbols:
-        fig, ax = plt.subplots(1, 1)
-        attr_set.plot_match(symbol, ax)
-        fig.savefig(data_fn(f"{symbol}_tradeplot.png"))
+        for symbol in symbols:
+            fig, ax = plt.subplots(1, 1)
+            # attr_set.plot_match(symbol, ax, by="time")
+            attr_set.plot_arrows(symbol, ax)
+            fig.savefig(data_fn(f"{symbol}_tradeplot_{mode}.png"))
 
-    summarize_closed_positions()
+    # summarize_closed_positions()
+    # attr_set = get_attr_set_from_trades(load_tradelogs(args.start, args.end, symbols - {'REZ'}))
+
+    # for sym, attr_set.
+    # plt.hist(gainz := [pa.net_gain for pa in attr_set.pas if abs(pa.net_gain) <= 50], bins=100)
+    # print(sum(gainz))
+    # plt.show()
 
 
 if __name__ == "__main__":
