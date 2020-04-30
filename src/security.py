@@ -44,7 +44,7 @@ def init_sec_logger() -> Logger:
     seclog.setLevel(INFO)
     seclog.addHandler(StreamHandler(sys.stderr))
     seclog.handlers[0].setFormatter(
-        Formatter(color("{asctime} SEC-{levelname} ∷ {message}", "yellow"), style="{",)
+        Formatter(color("yellow", "{asctime} SEC-{levelname} ∷ {message}"), style="{",)
     )
     return seclog
 
@@ -78,10 +78,10 @@ class ThreeTierGeneric(Generic[T]):
     def _confirm_danger(self, val: T) -> None:
         ans = input(
             color(
+                "blue",
                 f"SEC [{self.name}]"
                 f"({self.fmt_val(val)} {self.fmt_op()} {self.confirm_level}) "
                 f"'{self.confirm_msg}'. YES to confirm.\n",
-                "blue",
             )
         )
         if ans != "YES":

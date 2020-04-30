@@ -18,7 +18,11 @@ from ibapi.order_state import OrderState
 
 from src import config
 from src.app.base import TWSApp, wrapper_override
-from src.model.calc import find_closest_portfolio, check_if_needs_rebalance
+from src.model.calc import (
+    find_closest_portfolio,
+    check_if_needs_rebalance,
+    PortfolioSolverError,
+)
 from src.model.data import (
     OHLCBar,
     SimpleContract,
@@ -121,7 +125,7 @@ class AutorebalanceApp(TWSApp):
         self.log.info(f"Running with the following config:\n{self.conf.dump_config()}")
 
         self.order_id_queue: Queue[int] = Queue(maxsize=1)
-        self.order_manager = OrderManager(log=self.log)
+        self.order_manager = OrderManager()
 
     def next_requested_id(self, oid: int) -> None:
         try:
@@ -160,7 +164,7 @@ class AutorebalanceApp(TWSApp):
             f"EwLV={self.acct_state.ewlv / 1000:.1f}k."
         )
         if self.conf.armed:
-            self.log.warning(color("I am armed.", "red"))
+            self.log.warning(color("red", "I am armed."))
 
     @wrapper_override
     def position(
@@ -254,14 +258,18 @@ class AutorebalanceApp(TWSApp):
         state = self.order_manager[sc]
 
         if state == OMState.COOLOFF:
-            self.log.info(f"Dropping post-finalization call for {oid=}")
+            self.log.debug(f"Dropping post-finalization call for {oid=}")
             return
 
         assert state == OMState.TRANSMITTED or self.order_manager.transmit_order(sc)
 
         if status == "Filled":
             assert self.order_manager.finalize_order(sc)
-            self.log.info(f"Order for {pp_order(sc.as_contract, order)} finalized.")
+            self.log.info(
+                color(
+                    "green", f"Order for {pp_order(sc.as_contract, order)} finalized."
+                )
+            )
             self.reqPositions()
         else:
             self.log.debug(
@@ -363,14 +371,14 @@ class AutorebalanceApp(TWSApp):
         entered = self.order_manager.enter_order(sc, oid, order)
         if not entered:
             state = self.order_manager.get_state(sc)
-            self.log.info(f"Order for {sc.symbol} rejected by manager: {state}.")
+            self.log.debug(f"Order for {sc.symbol} rejected by manager: {state}.")
             return
         # ^ DO NOT REORDER THESE CALLS v
         self.placeOrder(oid, sc.as_contract, order)
         self.log.info(
             color(
-                f"Placed order {pp_order(sc.as_contract, order)}.",
                 "magenta" if not self.conf.armed else "red",
+                f"Placed order {pp_order(sc.as_contract, order)}.",
             )
         )
 
@@ -442,7 +450,7 @@ class AutorebalanceApp(TWSApp):
         self.log.info(f"Ideal (mu={target_mu * 100:.2f}%) = {ideal_fmt}")
 
         if len(self.rebalance_target) > 0:
-            self.log.info(
+            self.log.debug(
                 rebalance_msg := (
                     f"Rebalance targets: "
                     f"{ {k.symbol: v for k, v in self.rebalance_target.items()} }."
@@ -450,7 +458,7 @@ class AutorebalanceApp(TWSApp):
             )
             for sc, order in self.construct_rebalance_orders().items():
                 self.safe_place_order(sc, order)
-            self.order_manager.print_book()
+            self.log.debug(self.order_manager.format_book())
             self.notify_desktop(rebalance_msg)
 
         return True
@@ -468,7 +476,7 @@ class AutorebalanceApp(TWSApp):
         msg = f"TWS error channel: req({req_id}) ∷ {error_code} - {error_string}"
         # pacing violation
         if error_code == 420:
-            self.kill_app(color("🌿 error 420 🌿 you need to chill 🌿", "green"))
+            self.kill_app(color("green", "🌿 error 420 🌿 you need to chill 🌿"))
         elif error_code in PERMIT_ERROR:
             {
                 "DEBUG": self.log.debug,
@@ -479,7 +487,7 @@ class AutorebalanceApp(TWSApp):
             self.kill_app(msg)
 
     def kill_app(self, msg: str) -> NoReturn:
-        self.log.critical(color(f"Killed: {msg}", "red_1"))
+        self.log.critical(color("red_1", f"Killed: {msg}"))
         self.shut_down()
 
     def shut_down(self) -> None:
@@ -492,8 +500,8 @@ class AutorebalanceApp(TWSApp):
         try:
             self.log.info("I awaken. Greed is good!")
             if self.conf.armed:
-                self.log.warning(color("I am armed.", "red"))
-                self.log.warning(color("Coffee's on me ☕", "sandy_brown"))
+                self.log.warning(color("red", "I am armed."))
+                self.log.warning(color("sandy_brown", "Coffee's on me ☕"))
 
             self.ez_connect()
 
@@ -505,6 +513,7 @@ class AutorebalanceApp(TWSApp):
                 self.rebalance_worker,
                 self.conf.rebalance_freq,
                 heartbeat=self.conf.liveness_timeout,
+                suppress=(PortfolioSolverError,),
             )
             rebalance_worker.start()
             rebalance_worker.join()

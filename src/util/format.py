@@ -47,6 +47,6 @@ def assert_type(var: Any, typ: Type[T]) -> T:
     return var
 
 
-def color(msg: str, col: str) -> str:
+def color(col: str, msg: str) -> str:
     out: str = stylize(msg, fg(col), reset=True)
     return out

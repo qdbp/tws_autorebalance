@@ -19,6 +19,10 @@ from src.model.data import (
 )
 
 
+class PortfolioSolverError(Exception):
+    pass
+
+
 def find_closest_portfolio(
     funds: float, composition: Composition, prices: Dict[SimpleContract, float],
 ) -> Dict[SimpleContract, int]:
@@ -67,7 +71,10 @@ def find_closest_portfolio(
     )
     prob += loss
 
-    pulp.COIN().solve(prob)
+    try:
+        pulp.COIN().solve(prob)
+    except Exception as e:
+        raise PortfolioSolverError(e)
 
     assert "Infeasible" != (status := pulp.LpStatus[prob.status])
 

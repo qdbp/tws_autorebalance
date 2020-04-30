@@ -182,7 +182,7 @@ class TWSApp(EClient, EWrapper):
                 > self.__class__.HEARTBEATS[hb_key]
                 + self.__class__.HEARTBEAT_TIMEOUTS[hb_key]
             ):
-                self.log.fatal(color(f"Watchdog timeout for {hb_key}. Fatal.", "red"))
+                self.log.fatal(color("red", f"Watchdog timeout for {hb_key}. Fatal."))
                 self.shut_down()
         return True
 

@@ -82,7 +82,7 @@ class PriceLoaderApp(TWSApp):
 
         self.online = False
 
-        self.log.info(color("Data monkey prime is awake.", "yellow",))
+        self.log.info(color("yellow", "Data monkey prime is awake."))
         if try_connect:
             try:
                 self.ez_connect()

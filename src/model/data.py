@@ -7,7 +7,6 @@ from datetime import datetime, date
 from enum import Enum, auto
 # noinspection PyUnresolvedReferences
 from functools import cached_property
-from logging import Logger
 from types import MappingProxyType
 from typing import (
     Dict,
@@ -26,6 +25,7 @@ import numpy as np
 from ibapi.contract import Contract
 from ibapi.order import Order
 from matplotlib.axes import Axes
+from matplotlib.dates import date2num, WeekdayLocator, DateFormatter
 from matplotlib.ticker import MultipleLocator
 
 from src import security as sec
@@ -389,6 +389,8 @@ class AttributionSet:
         )
         buys = np.array([pa.buy_price for pa in pas for _ in range(abs(pa.qty))])
         sells = np.array([pa.sell_price for pa in pas for _ in range(abs(pa.qty))])
+        total_gain = (sells - np.minimum(sells, buys)).sum()
+        total_loss = (sells - np.maximum(sells, buys)).sum()
 
         ax.fill_between(
             range(len(buys)), buys, np.maximum(buys, sells), facecolor="green"
@@ -403,8 +405,6 @@ class AttributionSet:
         ax.yaxis.set_major_locator(MultipleLocator(10))
         ax.yaxis.set_minor_locator(MultipleLocator(2.5))
         ax.grid()
-        total_gain = (sells - np.minimum(sells, buys)).sum()
-        total_loss = (sells - np.maximum(sells, buys)).sum()
         net = total_gain + total_loss
         ax.set_title(
             f"{symbol} profits: {total_gain:.0f} - {-total_loss:.0f} = {net:.0f}"
@@ -760,9 +760,7 @@ class OrderManager:
     side-accounting tool. It cannot transmit, cancel, or modify actual TWS orders.
     """
 
-    def __init__(self, log: Logger):
-
-        self.log = log
+    def __init__(self) -> None:
 
         self._sc_by_oid: Dict[int, SimpleContract] = {}
         self._oid_by_sc: Dict[SimpleContract, int] = {}
@@ -827,14 +825,15 @@ class OrderManager:
     def get_order(self, sc: SimpleContract) -> Optional[Order]:
         return self._orders.get(sc)
 
-    def print_book(self) -> None:
+    def format_book(self) -> str:
+        out = ""
         for sc, state in self._order_state.items():
             msg = f"Order Book: {sc.symbol} = {state}"
             if state == OMState.ENTERED or state == OMState.TRANSMITTED:
                 order = self._orders[sc]
                 msg += f": {pp_order(sc.as_contract, order)}"
-            # TODO should be debug once things are finalized
-            self.log.info(msg)
+            out += msg + "\n"
+        return out
 
     def __getitem__(self, nc: SimpleContract) -> OMState:
         return self.get_state(nc)
