@@ -185,7 +185,8 @@ class AutorebalanceApp(TWSApp):
 
         sc = SimpleContract.from_contract(contract)
         assert isclose(position, int_pos := int(position))
-        self.position_acc[sc] = int_pos
+        if int_pos != 0:
+            self.position_acc[sc] = int_pos
 
     @wrapper_override
     def positionEnd(self) -> None:
@@ -406,7 +407,7 @@ class AutorebalanceApp(TWSApp):
         self.placeOrder(oid, sc.as_contract, order)
         self.log.info(
             color(
-                "magenta" if not self.conf.armed else "red",
+                "magenta" if not self.conf.armed else "blue",
                 f"Placed order {pp_order(sc.as_contract, order)}.",
             )
         )
@@ -418,7 +419,7 @@ class AutorebalanceApp(TWSApp):
 
     def notify_desktop(self, msg: str) -> None:
         subprocess.run(
-            ("notify-send", "-t", str(int(self.conf.rebalance_freq * 990)), msg)
+            ("notify-send", "-t", str(int(self.conf.rebalance_freq * 1010)), msg)
         )
 
     def rebalance_worker(self) -> bool:

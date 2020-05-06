@@ -68,7 +68,7 @@ class Trade:
 
     def __str__(self) -> str:
         return (
-            f"Trade({'＋' if self.qty > 0 else '－'} {self.sym:<4s} "
+            f"Trade({'＋' if self.qty > 0 else '－'}{self.sym:<4s} "
             f"$[{abs(self.qty):>3.0f} x {self.price:.3f}] @ {self.time})"
         )
 
