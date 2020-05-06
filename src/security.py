@@ -28,6 +28,7 @@ from src.util.format import color
 
 PERMIT_ERROR = MappingProxyType(
     {
+        202: "WARNING",  # order canceled
         504: "DEBUG",  # not connected -- always thrown on start
         2104: "DEBUG",  # Market data farm connection is OK
         2106: "DEBUG",  # A historical data farm is connected.
@@ -207,7 +208,7 @@ class Policy:
     )
 
     # number of seconds to wait before the same contract can be traded again
-    ORDER_COOLOFF = 60
+    ORDER_COOLOFF = 55
 
     MAX_PRICING_AGE = 20  # seconds
     MAX_ACCT_SUM_AGE = 120  # seconds

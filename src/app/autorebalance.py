@@ -4,7 +4,7 @@ import subprocess
 import sys
 from configparser import ConfigParser
 from dataclasses import dataclass, fields
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from math import isclose
 from queue import Queue, Full
 from time import sleep
@@ -15,6 +15,7 @@ from ibapi.common import TickerId
 from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.order_state import OrderState
+from pytz import UTC
 
 from src import config
 from src.app.base import TWSApp, wrapper_override
@@ -23,6 +24,7 @@ from src.model.calc import (
     check_if_needs_rebalance,
     PortfolioSolverError,
 )
+from src.model.constants import TZ_EASTERN, TWS_GTD_FORMAT
 from src.model.data import (
     OHLCBar,
     SimpleContract,
@@ -52,6 +54,10 @@ class AutorebalanceConfig:
     misalloc_frac_force_coef: float
     min_margin_req: float
 
+    # orders
+    order_timeout: int
+    max_slippage: float
+
     # app
     rebalance_freq: float
     liveness_timeout: float
@@ -67,6 +73,7 @@ class AutorebalanceConfig:
     def read_config(cls, cfg: ConfigParser) -> AutorebalanceConfig:
 
         strategy = cfg["strategy"]
+        orders = cfg["orders"]
 
         return cls(
             # strategy
@@ -88,6 +95,8 @@ class AutorebalanceConfig:
             rebalance_freq=cfg["app"].getfloat("rebalance_freq"),
             liveness_timeout=cfg["app"].getfloat("liveness_timeout"),
             armed=cfg["app"].getboolean("armed"),
+            order_timeout=orders.getint("order_timeout"),
+            max_slippage=orders.getfloat("max_slippage"),
         )
 
     def dump_config(self) -> str:
@@ -266,11 +275,16 @@ class AutorebalanceApp(TWSApp):
         if status == "Filled":
             assert self.order_manager.finalize_order(sc)
             self.log.info(
-                color(
-                    "green", f"Order for {pp_order(sc.as_contract, order)} finalized."
-                )
+                color("green", f"Order for {pp_order(sc.as_contract, order)} filled.")
             )
             self.reqPositions()
+        elif status == "Cancelled":
+            assert self.order_manager.finalize_order(sc)
+            self.log.info(
+                color(
+                    "dark_orange", f"Order {pp_order(sc.as_contract, order)} canceled."
+                )
+            )
         else:
             self.log.debug(
                 f"Order status for {pp_order(sc.as_contract, order)}: {status}"
@@ -324,7 +338,9 @@ class AutorebalanceApp(TWSApp):
             Policy.MARGIN_USAGE.block_level - 0.01,
         )
 
-    def construct_rebalance_orders(self) -> Dict[SimpleContract, Order]:
+    def construct_rebalance_orders(
+        self, price_snapshot: Dict[SimpleContract, float]
+    ) -> Dict[SimpleContract, Order]:
 
         total_amt = 0.0
         orders = {}
@@ -337,11 +353,24 @@ class AutorebalanceApp(TWSApp):
             order.totalQuantity = Policy.ORDER_QTY.validate(qty)
             order.action = "BUY" if num > 0 else "SELL"
 
+            # NB assumes we have 0.01 tick size -- this is fine for our universe
+            order.lmtPrice = round(
+                (price_snapshot[nc] + (-1 if num < 0 else 1) * self.conf.max_slippage),
+                2,
+            )
+            order.tif = "GTD"
+            # TODO fix for TWS not understanding EDT and set tz explicitly
+            # this, like all times in the program, are in US/Eastern time
+            order.goodTillDate = (
+                (datetime.now(UTC) + timedelta(seconds=self.conf.order_timeout))
+                .astimezone(TZ_EASTERN)
+                .strftime(TWS_GTD_FORMAT)
+            )
+
             orders[nc] = audit_order(order)
             total_amt += self.portfolio_prices[nc].c * qty
 
         Policy.ORDER_TOTAL.validate(total_amt)
-
         return orders
 
     def clear_any_untransmitted_order(self, sc: SimpleContract) -> None:
@@ -456,7 +485,7 @@ class AutorebalanceApp(TWSApp):
                     f"{ {k.symbol: v for k, v in self.rebalance_target.items()} }."
                 )
             )
-            for sc, order in self.construct_rebalance_orders().items():
+            for sc, order in self.construct_rebalance_orders(close_prices).items():
                 self.safe_place_order(sc, order)
             self.log.debug(self.order_manager.format_book())
             self.notify_desktop(rebalance_msg)

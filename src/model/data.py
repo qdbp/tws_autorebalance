@@ -22,15 +22,17 @@ from typing import (
 )
 
 import numpy as np
+from dateutil.rrule import MO
 from ibapi.contract import Contract
 from ibapi.order import Order
 from matplotlib.axes import Axes
-from matplotlib.dates import date2num, WeekdayLocator, DateFormatter
+from matplotlib.dates import date2num, WeekdayLocator, DateFormatter, DayLocator
 from matplotlib.ticker import MultipleLocator
+from pandas import date_range
 
 from src import security as sec
 from src.model.calc_primitives import sgn, get_loan_at_target_utilization
-from src.model.constants import ONE_DAY
+from src.model.constants import ONE_DAY, TZ_EASTERN
 from src.util.format import pp_order, fmt_dollars, assert_type
 
 
@@ -807,12 +809,12 @@ class OrderManager:
         if self.get_state(sc) != OMState.ENTERED:
             return False
         self._order_state[sc] = OMState.TRANSMITTED
+        self._cooloff_time[sc] = time.time()
         return True
 
     def finalize_order(self, sc: SimpleContract) -> bool:
         if self.get_state(sc) != OMState.TRANSMITTED:
             return False
-        self._cooloff_time[sc] = time.time()
         self._order_state[sc] = OMState.COOLOFF
         return True
 
