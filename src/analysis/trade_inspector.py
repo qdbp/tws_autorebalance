@@ -2,21 +2,10 @@ from __future__ import annotations
 
 from argparse import Namespace
 from collections import defaultdict
-from datetime import datetime, date
+from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import (
-    List,
-    DefaultDict,
-    Dict,
-    Set,
-    Any,
-    Tuple,
-    MutableMapping,
-    Container,
-    Optional,
-    Collection,
-)
+from typing import Any, Collection, Container, MutableMapping, Optional
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -24,19 +13,20 @@ import numpy as np
 import pandas as pd
 from dateutil.rrule import MO
 from matplotlib.axes import Axes
-from matplotlib.dates import WeekdayLocator, DateFormatter
+from matplotlib.dates import DateFormatter, WeekdayLocator
 from matplotlib.figure import Figure
 from matplotlib.ticker import MultipleLocator
+from tqdm import tqdm
 
 from src import config, data_fn
-from src.model.calc import calculate_profit_attributions, PAttrMode
-from src.model.constants import ONE_DAY
-from src.model.data import Trade, AttributionSet, Portfolio, Composition
+from src.model.calc import PAttrMode, calculate_profit_attributions
+from src.model.constants import ONE_DAY, TZ_EASTERN
+from src.model.data import AttributionSet, Composition, Portfolio, Trade
 
-matplotlib.rc("figure", figsize=(12, 12))
+matplotlib.rc("figure", figsize=(12, 8))
 
 
-TradesSet = MutableMapping[str, Set[Trade]]
+TradesSet = MutableMapping[str, set[Trade]]
 
 
 def parse_ibkr_report_tradelog(path: Path) -> TradesSet:
@@ -62,10 +52,15 @@ def parse_ibkr_report_tradelog(path: Path) -> TradesSet:
     if not data_lines:
         return out
 
-    df = pd.read_csv(StringIO("\n".join(data_lines)), thousands=",", header=None)
+    df = pd.read_csv(
+        StringIO("\n".join(data_lines)), thousands=",", header=None
+    )
     df.columns = columns
     df = df[["Date/Time", "Symbol", "Quantity", "T. Price", "Comm/Fee"]]
-    df["Date/Time"] = pd.to_datetime(df["Date/Time"])
+
+    # the account management reports use eastern time natively
+    # noinspection PyUnresolvedReferences
+    df["Date/Time"] = pd.to_datetime(df["Date/Time"]).dt.tz_localize(TZ_EASTERN)
 
     for date, symbol, qty, price, comm in df.itertuples(index=False):
 
@@ -87,7 +82,13 @@ def parse_tws_exported_tradelog(path: Path) -> TradesSet:
 
     for _, row in df.iterrows():
         qty = (-1 if row["Action"] == "SLD" else 1) * row["Quantity"]
-        t = row["Datetime"].to_pydatetime()
+        # the TWS intra-day reports use UTC
+        t = (
+            row["Datetime"]
+            .tz_localize(timezone.utc)
+            .tz_convert(TZ_EASTERN)
+            .to_pydatetime()
+        )
         # commission is positive in these tables, hence +
         price = row["Price"] + row["Commission"] / qty
         sym = row["Symbol"]
@@ -99,24 +100,27 @@ def load_tradelogs(
     start: datetime = None,
     end: datetime = None,
     symbols: Optional[Container[str]] = None,
-) -> Dict[str, List[Trade]]:
+) -> dict[str, list[Trade]]:
 
     trade_dir = Path(config()["trade_log"]["log_dir"]).expanduser()
-    all_trades: DefaultDict[str, Set[Trade]] = defaultdict(set)
+    all_trades: defaultdict[str, set[Trade]] = defaultdict(set)
 
     for fn in trade_dir.glob("*.csv"):
         fn_log = parse_ibkr_report_tradelog(fn)
         for sym, trades in fn_log.items():
             all_trades[sym] |= trades
 
-    tws_log_today = Path(config()["trade_log"]["tws_log_dir"]).joinpath(
-        f'trades.{date.today().strftime("%Y%m%d")}.csv'
-    ).expanduser()
+    tws_log_today = (
+        Path(config()["trade_log"]["tws_log_dir"])
+        .joinpath(f'trades.{date.today().strftime("%Y%m%d")}.csv')
+        .expanduser()
+    )
 
     if tws_log_today.exists():
         for k, trades in parse_tws_exported_tradelog(tws_log_today).items():
             all_trades[k] |= trades
 
+    # noinspection PyTypeChecker
     return {
         sym: keep_trades
         for sym, trades in all_trades.items()
@@ -150,7 +154,10 @@ def get_args() -> Namespace:
     )
 
     args = parser.parse_args()
-    args.end = min(args.end, datetime.now())
+    args.end = min(args.end, datetime.now() + ONE_DAY)
+
+    args.start = args.start.localize(TZ_EASTERN)
+    args.end = args.end.localize(TZ_EASTERN)
 
     assert args.end >= args.start
     return args
@@ -158,44 +165,34 @@ def get_args() -> Namespace:
 
 def plot_trade_profits(
     attr_set: AttributionSet, **plot_kwargs: Any
-) -> Tuple[Figure, Axes, Axes]:
+) -> tuple[Figure, Axes]:
 
     net_daily = attr_set.net_daily_attr
     dates, dailies = zip(*list(net_daily.items()))
 
-    ax1: Axes
-    ax2: Axes
-    fig, (ax1, ax2) = plt.subplots(nrows=2)
+    fig, ax = plt.subplots()
 
-    # date locators
-    for ax in (ax1, ax2):
-        ax.xaxis.set_major_locator(WeekdayLocator(byweekday=MO))
-        # one day
-        ax.xaxis.set_minor_locator(MultipleLocator(1))
-        ax.grid()
-        ax.grid(which="minor", lw=0.25)
+    ax.xaxis.set_major_locator(WeekdayLocator(byweekday=MO))
+    # one day
+    ax.xaxis.set_minor_locator(MultipleLocator(1))
+    ax.grid()
+    ax.grid(which="minor", lw=0.25)
 
-    ax1.yaxis.set_minor_locator(MultipleLocator(10))
-    ax2.yaxis.set_minor_locator(MultipleLocator(200))
-
-    ax2.xaxis.set_major_formatter(DateFormatter("%m-%d"))
-
-    ax1.plot(dates, dailies, label="daily profits (back-projected)", **plot_kwargs)
-    ax1.set_xticklabels([])
-    ax1.legend()
-    ax2.plot(
+    ax.yaxis.set_minor_locator(MultipleLocator(200))
+    ax.xaxis.set_major_formatter(DateFormatter("%m-%d"))
+    ax.plot(
         dates,
         np.cumsum(dailies),
         label="cumulative profit (back-projected)",
         color="k",
         **plot_kwargs,
     )
-    ax1.set_ylim(bottom=-100)
-    ax1.set_xlim(*ax1.get_xlim())
-    ax2.legend()
+    ax.set_ylabel("$")
+    ax.set_xlabel("Date")
+    ax.legend()
     plt.xticks(rotation=90)
 
-    return fig, ax1, ax2
+    return fig, ax
 
 
 def analyze_trades(
@@ -204,19 +201,15 @@ def analyze_trades(
     symbols: Collection[str],
     *,
     mode: PAttrMode = "min_variation",
-    ylim1: Tuple[int, int] = (-100, 250),
-    ylim2: Tuple[int, int] = (-2000, 5000),
+    ylim: tuple[int, int] = (-2000, 10000),
 ) -> AttributionSet:
 
     all_trades = load_tradelogs(start, end)
-
     all_dates = []
-
     tot_cash = []
     tot_basis = []
-    weighted_av_price = []
 
-    for cur_date in pd.bdate_range(start + ONE_DAY, end + ONE_DAY):
+    for cur_date in tqdm(pd.bdate_range(start, end, freq="M")):
         all_dates.append(cur_date)
         tot_cash.append(0.0)
         tot_basis.append(0.0)
@@ -229,7 +222,7 @@ def analyze_trades(
             if sym in symbols
         }
 
-        tot_basis_x_price = 0
+        tot_basis_x_price = 0.0
         attr_set = AttributionSet()
         for sym, (pas, pos) in attributed.items():
             if pos is None:
@@ -246,34 +239,16 @@ def analyze_trades(
             tot_cash[-1] += cash
             tot_basis[-1] += basis
 
-        if tot_basis[-1] > 0:
-            weighted_av_price.append(tot_basis_x_price / tot_basis[-1])
-        else:
-            weighted_av_price.append(0.0)
-
-    w_av_p = np.array(weighted_av_price)
-
     # noinspection PyUnboundLocalVariable
-    fig, ax1, ax2 = plot_trade_profits(attr_set)
-    ax1.plot(
-        all_dates,
-        (w_av_p - 125) * 4,
-        color="orange",
-        label="weighted average price (rescaled)",
-        lw=0.75,
-    )
-    ax2.plot(
+    fig, ax = plot_trade_profits(attr_set)
+    ax.plot(
         all_dates,
         np.array(tot_cash) + np.array(tot_basis),
         color="grey",
         label="cumulative profit (marching)",
     )
-    ax2.legend()
-    ax1.set_title(f"Profits from {start.date()} to {end.date()}, method='{mode}'")
-    ax1.legend()
-    ax1.set_ylim(*ylim1)
-    ax1.set_xlim(*ax2.get_xlim())
-    ax2.set_ylim(*ylim2)
+    ax.set_title(f"Cumulative profit over time ({mode})")
+    ax.set_ylim(*ylim)
     fig.show()
 
     return attr_set
@@ -295,7 +270,7 @@ def summarize_closed_positions() -> None:
 
 
 def get_attr_set_from_trades(
-    all_trades: Dict[str, List[Trade]], symbols: Set[str] = None
+    all_trades: dict[str, list[Trade]], symbols: set[str] = None
 ) -> AttributionSet:
 
     all_pas = {
@@ -313,26 +288,23 @@ def main() -> None:
     args = get_args()
 
     symbols = {
-        sc.symbol for sc in Composition.parse_ini_composition(config()).contracts
+        sc.symbol
+        for sc in Composition.parse_ini_composition(config()).contracts
     }
 
     mode: PAttrMode
-    for mode in ["shortest", "min_variation"]:
+    for mode in ["shortest", "min_variation"]:  # type: ignore
         attr_set = analyze_trades(args.start, args.end, symbols, mode=mode)
-
         for symbol in symbols:
             fig, ax = plt.subplots(1, 1)
-            # attr_set.plot_match(symbol, ax, by="time")
-            attr_set.plot_arrows(symbol, ax)
-            fig.savefig(data_fn(f"{symbol}_tradeplot_{mode}.png"))
+            attr_set.plot_arrows(
+                symbol, ax, start=args.start, end=args.end + ONE_DAY
+            )
+            fig.tight_layout()
+            fig.savefig(data_fn(f"{symbol}_trade_plot_{mode}.png"))
+            plt.close(fig)
 
-    # summarize_closed_positions()
-    # attr_set = get_attr_set_from_trades(load_tradelogs(args.start, args.end, symbols - {'REZ'}))
-
-    # for sym, attr_set.
-    # plt.hist(gainz := [pa.net_gain for pa in attr_set.pas if abs(pa.net_gain) <= 50], bins=100)
-    # print(sum(gainz))
-    # plt.show()
+    summarize_closed_positions()
 
 
 if __name__ == "__main__":

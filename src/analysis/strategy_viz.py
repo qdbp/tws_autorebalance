@@ -1,5 +1,3 @@
-from typing import Tuple
-
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
@@ -29,7 +27,7 @@ def plot_loan_target_vs_nav(
     ath_price: float = 100.0,
     margin_req: float = 0.25,
     do_label: bool = False,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
 
     # from rearranging the maintenance margin formula
     gpv = ath_price * starting_shares / (1 + ath_mu * (margin_req - 1))
@@ -41,14 +39,17 @@ def plot_loan_target_vs_nav(
     shares: float = gpv / ath_price
     dds = [0.0]
     eqs = [shares]
+    navs = [gpv + loan]
 
     max_lt = loan
     max_e: float = gpv / ath_price
     max_dd = 0.0
 
-    increment = int(ath_price) // 20
+    increment = int(ath_price) // 40
 
-    for price in np.arange(int(ath_price) - increment, int(ath_price) // 5, -increment):
+    for price in np.arange(
+        int(ath_price) - increment, int(ath_price) // 5, -increment
+    ):
 
         dd = drawdown(price, ath_price)
         gpv = price * shares
@@ -80,13 +81,16 @@ def plot_loan_target_vs_nav(
         lts.append(loan_target)
         mus.append(mu)
         eqs.append(shares)
+        navs.append(gpv - loan)
 
     ax.set_title(f"{ath_mu:.2f} initial margin usage")
     ax2 = ax.twinx()
 
     ax.set_xlabel("drawdown")
 
-    ax.plot(dds, mus, label="margin utilization" if do_label else None, color="k")
+    ax.plot(
+        dds, mus, label="margin utilization" if do_label else None, color="k"
+    )
     ax.set_ylabel("margin utilization")
 
     ax2.plot(dds, lts, label="loan target" if do_label else None)
@@ -110,6 +114,18 @@ def plot_loan_target_vs_nav(
         color="red",
         ls="--",
     )
+    ax2.plot(
+        dds,
+        navs,
+        label="nav" if do_label else None,
+        color="grey",
+    )
+    ax2.plot(
+        dds,
+        ath_price * np.array(eqs) - np.array(lts),
+        label="ewlv at ATH" if do_label else None,
+        color="brown",
+    )
     ax2.text(
         max_dd,
         max_e * ath_price,
@@ -125,7 +141,6 @@ def plot_loan_target_vs_nav(
 
 if __name__ == "__main__":
     fig, ax = plt.subplots(1, 1)
-    plot_loan_target_vs_nav(ax, 0.0, 3.8, do_label=False)
-    plot_loan_target_vs_nav(ax, 0.0, 1.5, do_label=False)
-    plot_loan_target_vs_nav(ax, 0.0, 1.2, do_label=False)
+    plot_loan_target_vs_nav(ax, -0.05, 2.0, starting_shares=1000, ath_price=260)
+    # plot_loan_target_vs_nav(ax, 0.0, 1.2, do_label=False)
     plt.show()

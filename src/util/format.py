@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Literal, Any, TypeVar, Type
+from typing import Any, Literal, Type, TypeVar
 
 from colored import fg, stylize
 from ibapi.contract import Contract
@@ -7,7 +7,9 @@ from ibapi.order import Order
 
 
 def pp_order(nc: Contract, order: Order) -> str:
-    return f"{order.action} {order.totalQuantity} {nc.symbol} ({order.orderType})"
+    return (
+        f"{order.action} {order.totalQuantity} {nc.symbol} ({order.orderType})"
+    )
 
 
 def fmt_dollars(dollars: float, width: int = 6) -> str:

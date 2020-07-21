@@ -1,21 +1,21 @@
 from dataclasses import replace
 from functools import lru_cache
 from itertools import product
-from typing import Dict, List, Tuple, Literal, Optional
+from typing import Literal, Optional
 
 import numpy as np
 import pulp
-from pulp import LpInteger, LpProblem, LpMinimize, COIN, LpStatus
+from pulp import COIN, LpInteger, LpMinimize, LpProblem, LpStatus
 from pulp_lparray import lparray
 
 from src import security as sec
 from src.model.calc_primitives import shrink
 from src.model.data import (
     Composition,
-    Trade,
-    ProfitAttribution,
     Position,
+    ProfitAttribution,
     SimpleContract,
+    Trade,
 )
 
 
@@ -24,17 +24,19 @@ class PortfolioSolverError(Exception):
 
 
 def find_closest_portfolio(
-    funds: float, composition: Composition, prices: Dict[SimpleContract, float],
-) -> Dict[SimpleContract, int]:
+    funds: float,
+    composition: Composition,
+    prices: dict[SimpleContract, float],
+) -> dict[SimpleContract, int]:
     """
-    Constructs the most closely-matching concrete, integral-share Portfolio matching
-    this Allocation.
+    Constructs the most closely-matching concrete, integral-share Portfolio
+    matching this Allocation.
 
     It is guaranteed that portfolio.gpv <= allocation.
 
-    Using a MILP solver might be overkill for this, but we do, ever-so-rarely, round
-    the other way from the target (fractional) allocation. This lets us do that
-    correctly without guesswork. Can't be too careful with money.
+    Using a MILP solver might be overkill for this, but we do, ever-so-rarely,
+    round the other way from the target (fractional) allocation. This lets us do
+    that correctly without guesswork. Can't be too careful with money.
 
     :param funds: total amount of money available to spend on the portfolio.
     :param composition: the target composition to approximate
@@ -54,15 +56,19 @@ def find_closest_portfolio(
 
     prob = pulp.LpProblem()
 
-    alloc = lparray.create_anon("Alloc", shape=comp_arr.shape, cat=pulp.LpInteger)
+    alloc = lparray.create_anon(
+        "Alloc", shape=comp_arr.shape, cat=pulp.LpInteger
+    )
 
     (alloc >= 0).constrain(prob, "NonNegativePositions")
 
     cost = (alloc @ price_arr).sum()
     (cost <= funds).constrain(prob, "DoNotExceedFunds")
 
-    # TODO bigM here should be the maximum possible value of alloc - target_alloc
-    # while 100k should be enough for reasonable uses, we can figure out a proper max
+    # TODO bigM here should be the maximum possible value of
+    # alloc - target_alloc
+    # while 100k should be enough for reasonable uses, we can figure out a
+    # proper max
     loss = (
         # rescale by inverse composition to punish relative deviations equally
         ((alloc - target_alloc) * (1 / comp_arr))
@@ -72,7 +78,7 @@ def find_closest_portfolio(
     prob += loss
 
     try:
-        pulp.COIN().solve(prob)
+        pulp.COIN(msg=False).solve(prob)
     except Exception as e:
         raise PortfolioSolverError(e)
 
@@ -88,63 +94,61 @@ def find_closest_portfolio(
     return {c: int(v) for c, v in zip(composition.contracts, alloc.values)}
 
 
-def check_if_needs_rebalance(
+def calc_relative_misallocation(
+    ewlv: float,
     price: float,
     cur_alloc: int,
     target_alloc: int,
     *,
-    misalloc_min_dollars: float,
-    misalloc_min_fraction: float,
-    misalloc_frac_elbow: float,
-    misalloc_frac_coef: float,
-) -> bool:
+    frac_coef: float,
+    pvf_coef: float,
+) -> float:
 
     assert target_alloc >= 1
     assert cur_alloc >= 1
-    assert misalloc_frac_elbow >= misalloc_min_fraction > 1.0
-    assert misalloc_frac_coef >= 0.0
 
-    misalloc_frac = max(target_alloc / cur_alloc, cur_alloc / target_alloc)
-    sufficiently_misallocated = misalloc_frac > misalloc_min_fraction
+    δ_frac = abs(1.0 - cur_alloc / target_alloc)
+    δ_pvf = price * abs(cur_alloc - target_alloc) / ewlv
 
-    d_dollars = price * abs(cur_alloc - target_alloc) + misalloc_frac_coef * max(
-        0.0, 100 * (misalloc_frac - misalloc_frac_elbow)
-    )
-    large_enough_trade = d_dollars >= misalloc_min_dollars
-
-    return large_enough_trade and sufficiently_misallocated
+    return frac_coef * δ_frac + pvf_coef * δ_pvf
 
 
-PAttrMode = Literal["max_loss", "max_gain", "min_variation", "longest", "shortest"]
+PAttrMode = Literal[
+    "max_loss", "max_gain", "min_variation", "longest", "shortest"
+]
 
 
 @lru_cache()
 def calculate_profit_attributions(
-    trades: Tuple[Trade], mode: PAttrMode = "min_variation", minvar_gamma: float = 1.05,
-) -> Tuple[List[ProfitAttribution], Optional[Position]]:
+    trades: tuple[Trade],
+    mode: PAttrMode = "min_variation",
+    min_var_gamma: float = 1.05,
+) -> tuple[list[ProfitAttribution], Optional[Position]]:
 
     """
-    Convert a list of trades into ProfitAttributions, matching opposite-side trades
-    in a LIFO fashion. Returns this list and the net unmatched position.
+    Convert a list of trades into ProfitAttributions, matching opposite-side
+    trades in a LIFO fashion. Returns this list and the net unmatched position.
 
     Uses a MILP solver to assign opening trades to closing trades according to a
     preferred criterion, given as `mode`. The modes are:
 
-        max_loss: attempt to maximize losses by matching lowest sells with highest
-            buys. Note that this can be acausal, e.g. a sale can be matched
-            with a later buy even when you are long the instrument at the time it is
-            made.
+    Modes:
+        max_loss: attempt to maximize losses by matching lowest sells with
+            highest buys. Note that this can be acausal, e.g. a sale can be
+            matched with a later buy even when you are long the instrument at
+            the time it is made.
         max_gain: the opposite of max_loss, same caveat.
         min_variation: attempt to minimize total variation in realized gains.
         longest: maximizes the total time between opening and closing trades.
-        shortes: minimizes the total time between opening and closing trades.
+        shortest: minimizes the total time between opening and closing trades.
 
     Args:
         trades: the list of trades to parse into attributions
         mode: the mode, as described above.
-        minvar_gamma: if the mode is min_variation, the price gap is actually raised
-            to this power (which should be just above 1) in the price matrix to force
-            the optimizer to minimize the average individual gaps as a quasi-subproblem.
+        min_var_gamma: if the mode is min_variation, the price gap is actually
+            raised to this power (which should be just above 1) in the price
+            matrix to force the optimizer to minimize the average individual
+            gaps as a quasi-subproblem.
 
     Returns:
         a tuple of:
@@ -166,7 +170,8 @@ def calculate_profit_attributions(
 
     loss = np.zeros((nb, ns))
 
-    # for many of these modes there are probably bespoke algorithms with more finesse...
+    # for many of these modes there are probably bespoke algorithms with more
+    # finesse...
     # ... but the sledgehammer is more fun than the scalpel.
     for bx, sx in product(range(nb), range(ns)):
         buy = buys[bx]
@@ -176,7 +181,7 @@ def calculate_profit_attributions(
         elif mode == "max_gain":
             loss[bx, sx] = buy.price - sell.price
         elif mode == "min_variation":
-            loss[bx, sx] = abs(buy.price - sell.price) ** minvar_gamma
+            loss[bx, sx] = abs(buy.price - sell.price) ** min_var_gamma
         elif mode == "longest":
             start = min(buy.time, sell.time)
             end = max(buy.time, sell.time)
@@ -188,8 +193,8 @@ def calculate_profit_attributions(
         else:
             raise ValueError()
 
-    # we ensure that we always decrease our loss by making any assignment to guarantee
-    # that all min(nb, ns) possible shares are matched.
+    # we ensure that we always decrease our loss by making any assignment to
+    # guarantee that all min(nb, ns) possible shares are matched.
     # noinspection PyArgumentList
     loss -= loss.max() + 1.0
 
@@ -198,7 +203,9 @@ def calculate_profit_attributions(
 
     prob = LpProblem(sense=LpMinimize)
 
-    match: lparray = lparray.create_anon("Match", (nb, ns), cat=LpInteger, lowBound=0)
+    match: lparray = lparray.create_anon(
+        "Match", (nb, ns), cat=LpInteger, lowBound=0
+    )
 
     (match.sum(axis=0) <= sell_qty_limit).constrain(prob, "SellLimit")
     (match.sum(axis=1) <= buy_qty_limit).constrain(prob, "BuyLimit")
@@ -206,7 +213,7 @@ def calculate_profit_attributions(
     cost = (match * loss).sumit()
     prob += cost
 
-    COIN().solve(prob)
+    COIN(msg=False, threads=24).solve(prob)
     solution = match.values
 
     assert LpStatus[prob.status] == "Optimal"
@@ -226,8 +233,12 @@ def calculate_profit_attributions(
 
         pas.append(
             ProfitAttribution(
-                open_trade=new_buy if new_buy.time < new_sell.time else new_sell,
-                close_trade=new_buy if new_buy.time > new_sell.time else new_sell,
+                open_trade=new_buy
+                if new_buy.time < new_sell.time
+                else new_sell,
+                close_trade=new_buy
+                if new_buy.time > new_sell.time
+                else new_sell,
             )
         )
 

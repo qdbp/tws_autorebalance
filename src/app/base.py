@@ -1,119 +1,126 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from functools import wraps
-from logging import Logger, getLogger, INFO, StreamHandler, Formatter
-from threading import Event, Thread
-from time import sleep, time as utime
-from typing import (
-    TypeVar,
-    Callable,
-    NoReturn,
-    Optional,
-    Dict,
-    Type,
-    Tuple,
-)
+from logging import INFO, Logger, StreamHandler, getLogger
+from threading import Event, Lock, Thread, current_thread
+from time import time as utime
+from typing import Callable
+from typing import Optional as Opt
+from typing import Type
+from uuid import UUID, uuid4
 
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
+from py9lib.log import get_nice_formatter
 
 from src.util.format import color
 
-FNone = TypeVar("FNone", bound=Callable[..., None])
+
+@dataclass()
+class HeartBeat:
+    id: UUID
+    name: str
+    ts: float
+    period: float
+
+    def __hash__(self) -> int:
+        return hash(self.id)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, HeartBeat) and self.id == other.id
 
 
-def wrapper_override(f: FNone) -> FNone:
-    assert hasattr(EWrapper, f.__name__)
-    return f
-
-
-class TWSApp(EClient, EWrapper):
+class TWSApp(EClient, EWrapper):  # type: ignore
     """
     Base class for qdbp's premier TWS API applications.
     """
 
-    IDS = set()
-    TWS_DEFAULT_PORT = 7496
+    IDS: set[int] = set()
+    TWS_DEFAULT_PORT = 42069
 
-    HEARTBEAT_TIMEOUTS: Dict[str, float] = {}
-    HEARTBEATS: Dict[str, float] = {}
-
-    def __init__(self, client_id: int) -> None:
+    def __init__(self, client_id: int, log_level: int = INFO) -> None:
         EWrapper.__init__(self)
         EClient.__init__(self, wrapper=self)
 
         assert client_id not in self.IDS, f"Duplicate ID {client_id}"
 
         self.client_id = client_id
-        self.IDS.add(client_id)
+        TWSApp.IDS.add(client_id)
 
-        self.log = self._setup_log()
+        self.log = self._set_up_log()
+        self.log.setLevel(log_level)
 
         self._initialized = Event()
         self._workers_halt = Event()
+        self._worker_threads: set[Thread] = set()
 
-        self.prepare_worker(self.heartbeat_worker, 1.0).start()
+        self._has_shut_down = Event()
+        self._shutdown_lock = Lock()
 
-    @classmethod
-    def prepare_worker(
-        cls,
+        self._heartbeats: dict[UUID, HeartBeat] = {}
+
+        self.start_worker(self.heartbeat_worker, 1.0)
+
+    def start_worker(
+        self,
         worker_method: Callable[[], bool],
         delay: float,
-        suppress: Tuple[Type[Exception], ...] = (),
-        heartbeat: Optional[float] = None,
+        suppress: tuple[Type[Exception], ...] = (),
+        hb_period: Opt[float] = None,
     ) -> Thread:
         """
-
-        A worker method is an operation that should be performed periodically and
-        indefinitely in a separate thread. This method should return True on a
-        successful run, and False on an unsuccessful run.
+        A worker method is an operation that should be performed periodically
+        and indefinitely in a separate thread. This method should return True
+        on a successful run, and False on an unsuccessful run.
 
         This function takes a method that performs one iteration of the work and
-        instruments it with the loop and thread. The worker loop checks as a stopping
-        condition for the Event "workers_halt" to be set. This is a way to coordinate
-        app shutdown by stopping all workers.
+        instruments it with the loop and thread. The worker loop checks as a
+        stopping condition for the Event "workers_halt" to be set. This is a way
+        to coordinate app shutdown by stopping all workers.
 
-        Optionally, it also installs a "heartbeat monitor" for the worker, such that
-        an error will be logged if the worker has not run successfully for some amount
-        of time, whether by returning False consistently or simply not executing.
+        Optionally, it also installs a "heartbeat monitor" for the worker, such
+        that an error will be logged if the worker has not run successfully for
+        some amount of time, whether by returning False consistently or simply
+        not executing.
 
         Args:
             worker_method: the method, which should execute one iteration of the
                 desired job.
-            delay: the amount of time to wait between each execution of the worker.
-                As implemented this is a simple sleep, so the actual delay between
-                invocations will be delay + execution time.
-            suppress: a list of exception types which will be caught and suppressed
-                with a warning in the worker thread. Other exceptions are considered
-                fatal and will result in app shutdown.
-            heartbeat: an optional float. If not None, this will request that a monitor
-                thread regularly check that the worker has not failed to execute for
-                at least this many seconds. If this check fails, the app is terminated
-                with an appropriate message.
+            delay: the amount of time to wait between each execution of the
+                worker. As implemented this is a simple sleep, so the actual
+                delay between invocations will be delay + execution time.
+            suppress: a list of exception types which will be caught and
+                suppressed with a warning in the worker thread. Other exceptions
+                are considered fatal and will result in app shutdown.
+            hb_period: an optional float. If not None, this will request that a
+                monitor thread regularly check that the worker has not failed to
+                execute for at least this many seconds. If this check fails,
+                the app is terminated with an appropriate message.
         Returns:
-            a Thread object which when started will execute the worker in a loop.
-
+            a Thread object which when started will execute the worker in a
+            loop.
         """
 
         app: TWSApp
         # noinspection PyTypeChecker,PyUnresolvedReferences
         assert isinstance(
-            app := worker_method.__self__, TWSApp
+            app := worker_method.__self__, TWSApp  # type: ignore
         ), "Preparing non-TWS method!"
-        assert heartbeat is None or heartbeat > delay
+        assert hb_period is None or hb_period > delay
         assert delay >= 0.0
 
-        if heartbeat is not None:
-            hb_key = f"{cls.__name__}/{worker_method.__name__}"
-            cls.HEARTBEAT_TIMEOUTS[hb_key] = heartbeat
-            cls.HEARTBEATS[hb_key] = utime()
-        else:
-            hb_key = None
+        if hb_period is not None:
+            hb_key: UUID = uuid4()
+            self._heartbeats[hb_key] = HeartBeat(
+                hb_key, worker_method.__name__, utime(), hb_period
+            )
 
-        # kwarg to avoid late binding issues -- should not be used.
+        # kwargs to avoid late binding issues -- should not be used.
         @wraps(worker_method)
-        def _worker(_heartbeat=heartbeat, _hb_key=hb_key, _delay=delay) -> NoReturn:
+        def _worker() -> None:
+
             last_scheduled = utime()
             while not app._workers_halt.is_set():
                 # noinspection PyBroadException
@@ -125,64 +132,80 @@ class TWSApp(EClient, EWrapper):
                     )
                     success = False
                 except Exception as e:
-                    app.log.fatal(f"Uncaught exception {e} in {worker_method.__name__}")
+                    app.log.critical(
+                        f"Uncaught exception {e} in {worker_method.__name__}"
+                    )
                     app.shut_down()
                     raise
 
-                if _hb_key is not None and success:
-                    TWSApp.HEARTBEATS[_hb_key] = utime()
+                if hb_period is not None and success:
+                    self._heartbeats[hb_key].ts = utime()
 
-                if _delay == 0.0:
+                if delay == 0.0:
                     continue
                 else:
-                    next_scheduled = last_scheduled + _delay
-                    sleep(max(0.001, next_scheduled - utime()))
+                    next_scheduled = last_scheduled + delay
+                    app._workers_halt.wait(
+                        timeout=max(0.001, next_scheduled - utime())
+                    )
                     last_scheduled = next_scheduled
 
-        return worker_thread(_worker)
+        thread = worker_thread(_worker)
+        thread.start()
 
-    def _setup_log(self) -> Logger:
+        self._worker_threads.add(thread)
+        return thread
+
+    def _set_up_log(self) -> Logger:
         log = getLogger(self.__class__.__name__)
         log.setLevel(INFO)
+        log.handlers.clear()
         log.addHandler(StreamHandler(sys.stdout))
-        log.handlers[0].setFormatter(
-            Formatter("{asctime} {levelname:1s}@{funcName} ∷ {message}", style="{")
-        )
+        log.handlers[0].setFormatter(get_nice_formatter())
         return log
 
-    @wrapper_override
-    def nextValidId(self, oid: int):
+    def nextValidId(self, oid: int) -> None:
         if not self._initialized.is_set():
             self._initialized.set()
-            return
         else:
             self.next_requested_id(oid)
 
     def next_requested_id(self, oid: int) -> None:
         """
-        This method should implement the actual logic of "nextValidId" as it is used
-        after the initialization call.
+        This method should implement the actual logic of "nextValidId" as it is
+        used after the initialization call.
         """
-        pass
 
     def ez_connect(self) -> None:
         super().connect("127.0.0.1", self.TWS_DEFAULT_PORT, self.client_id)
         worker_thread(self.run).start()
         self._initialized.wait()
 
-    def shut_down(self) -> None:
+    def clean_up(self) -> None:
         self._workers_halt.set()
         if self.isConnected():
             self.disconnect()
+        for thread in self._worker_threads:
+            if thread is current_thread():
+                continue
+            self.log.debug(f"Waiting on {thread}...")
+            thread.join()
+        TWSApp.IDS.remove(self.client_id)
+
+    def shut_down(self) -> None:
+        with self._shutdown_lock:
+            if self._has_shut_down.is_set():
+                return
+            self.log.info(f"Shutting down @{TWSApp.__name__}")
+            self.clean_up()
+            self._has_shut_down.set()
 
     def heartbeat_worker(self) -> bool:
-        for hb_key, thresh in self.__class__.HEARTBEAT_TIMEOUTS.items():
-            if (
-                utime()
-                > self.__class__.HEARTBEATS[hb_key]
-                + self.__class__.HEARTBEAT_TIMEOUTS[hb_key]
-            ):
-                self.log.fatal(color("red", f"Watchdog timeout for {hb_key}. Fatal."))
+        for hb_key, hb in self._heartbeats.items():
+            if utime() > hb.ts + hb.period:
+                self.log.critical(
+                    color("red", f"Watchdog timeout for '{hb.name}'. Fatal.")
+                )
                 self.shut_down()
         return True
 
