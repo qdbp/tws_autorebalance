@@ -1,0 +1,170 @@
+{
+  "$id": "me.enaumov.tws_autorebalance.autorebalance.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Autorebalance Config",
+  "type": "object",
+  "required": [
+    "strategy",
+    "settings"
+  ],
+  "properties": {
+    "strategy": {
+      "required": [
+        "accounts"
+      ],
+      "properties": {
+        "accounts": {
+          "additionalProperties": false,
+          "type": "object",
+          "patternProperties": {
+            "^[a-zA-Z0-9]+$": {
+              "type": "object",
+              "required": [
+                "composition",
+                "rebalance"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "composition": {
+                  "additionalProperties": false,
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/composition"
+                  }
+                },
+                "margin": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "required": [
+                    "dd_reference_ath",
+                    "mu_at_ath",
+                    "dd_coef",
+                    "min_margin_req",
+                    "update_ath"
+                  ],
+                  "properties": {
+                    "dd_reference_ath": {
+                      "type": "number",
+                      "minimum": 0.01
+                    },
+                    "mu_at_ath": {
+                      "type": "number",
+                      "minimum": -1.0
+                    },
+                    "dd_coef": {
+                      "type": "number"
+                    },
+                    "min_margin_req": {
+                      "type": "number",
+                      "minimum": 0.0,
+                      "maximum": 1.0
+                    },
+                    "update_ath": {
+                    }
+                  }
+                },
+                "rebalance": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "required": [
+                    "misalloc_frac_coef",
+                    "misalloc_pvf_coef"
+                  ],
+                  "properties": {
+                    "misalloc_frac_coef": {
+                      "type": "number",
+                      "description": "coefficient of percent misallocation into rebalancing indicator"
+                    },
+                    "misalloc_pvf_coef": {
+                      "type": "number",
+                      "description": "coefficient of cash misallocation into rebalancing indicator"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "description": "The person's first name."
+        }
+      }
+    },
+    "settings": {
+      "required": [
+        "armed",
+        "order_timeout",
+        "max_slippage",
+        "rebalance_freq",
+        "liveness_timeout"
+      ],
+      "properties": {
+        "armed": {
+          "type": "boolean",
+          "description": "If True, the bot sends live trades."
+        },
+        "order_timeout": {
+          "type": "number",
+          "description": "After placing an order, will not trade the same security for this many seconds."
+        },
+        "max_slippage": {
+          "type": "number",
+          "description": "Will execute orders only within this many dollars of the target price."
+        },
+        "rebalance_freq": {
+          "type": "number",
+          "description": "Will calculate the target portfolio, and place trades if needed, every this many seconds."
+        },
+        "liveness_timeout": {
+          "type": "number",
+          "description": "Will shut down if has not received new prices within this many seconds."
+        }
+      }
+    },
+    "log": {
+      "description": "Tells the app where to find various logs.",
+      "type": "object",
+      "properties": {
+        "ibkr": {
+          "type": "string",
+          "description": "Where IBKR logs are downloaded."
+        },
+        "tws": {
+          "type": "string",
+          "description": "Where TWS saves intraday logs."
+        }
+      }
+    }
+  },
+  "definitions": {
+    "composition": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "ticker",
+        "pex",
+        "pct"
+      ],
+      "properties": {
+        "ticker": {
+          "type": "string",
+          "description": "instrument symbol as understood by TWS"
+        },
+        "pex": {
+          "type": "string",
+          "description": "The primary exchange of the symbol."
+        },
+        "pct": {
+          "minimum": 0.0,
+          "maximum": 100.0,
+          "type": "number",
+          "description": "Current target composition, percent. The bot will trade to match this value immediately."
+        },
+        "target": {
+          "minimum": 0.0,
+          "maximum": 100.0,
+          "type": "number",
+          "description": "Goal target composition, percent. The bot will try to passively drift toward this value, changing cur_pct along the way."
+        }
+      }
+    }
+  }
+}

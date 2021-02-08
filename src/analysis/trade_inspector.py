@@ -19,9 +19,11 @@ from matplotlib.ticker import MultipleLocator
 from tqdm import tqdm
 
 from src import config, data_fn
+from src.model import Acct
 from src.model.calc import PAttrMode, calculate_profit_attributions
 from src.model.constants import ONE_DAY, TZ_EASTERN
-from src.model.data import AttributionSet, Composition, Portfolio, Trade
+from src.model.data import Composition
+from src.model.data.trades import AttributionSet, Portfolio, Trade
 
 matplotlib.rc("figure", figsize=(12, 8))
 
@@ -102,8 +104,9 @@ def load_tradelogs(
     symbols: Optional[Container[str]] = None,
 ) -> dict[str, list[Trade]]:
 
-    trade_dir = Path(config()["trade_log"]["log_dir"]).expanduser()
     all_trades: defaultdict[str, set[Trade]] = defaultdict(set)
+
+    trade_dir = config()["log"]["ibkr"]
 
     for fn in trade_dir.glob("*.csv"):
         fn_log = parse_ibkr_report_tradelog(fn)
@@ -111,7 +114,7 @@ def load_tradelogs(
             all_trades[sym] |= trades
 
     tws_log_today = (
-        Path(config()["trade_log"]["tws_log_dir"])
+        Path(config()["log"]["tws"])
         .joinpath(f'trades.{date.today().strftime("%Y%m%d")}.csv')
         .expanduser()
     )
@@ -284,12 +287,14 @@ def get_attr_set_from_trades(
     return attr_set
 
 
-def main() -> None:
+def main(acct: Acct) -> None:
     args = get_args()
 
     symbols = {
         sc.symbol
-        for sc in Composition.parse_ini_composition(config()).contracts
+        for sc in Composition.parse_config_section(
+            config()["strategy"][acct]["composition"]
+        )[0].contracts
     }
 
     mode: PAttrMode
@@ -305,7 +310,3 @@ def main() -> None:
             plt.close(fig)
 
     summarize_closed_positions()
-
-
-if __name__ == "__main__":
-    main()

@@ -1,69 +1,17 @@
-"""
-This file defines primitives to ensure financial security throughout the
-application by validating that quantities representing financial risk, such as
-trade size, loan size, etc., are bounds-checked at the time of calculation.
-
-The goal is to ensure operational security and satisfaction of risk constraints.
-This differs and complements standard bounds-checking, which should still be
-used throughout to validate the mathematical soundness of program logic.
-
-In order to keep security policies as concise as possible, this module should
-not care if parameters are unreasonable in a non-dangerous direction. e.g. the
-rebalance threshold is so high the program never trades.
-"""
 import operator
-import sys
 from abc import abstractmethod
 from dataclasses import dataclass
-from logging import INFO, Formatter, Logger, StreamHandler, getLogger
-from types import MappingProxyType
-from typing import Callable, Generic, TypeVar
+from typing import Callable, Generic
 
-from ibapi.order import Order
-
-from src import config
+from src.security import LOG, N, SecError, T
 from src.util.format import color
 
-PERMIT_ERROR = MappingProxyType(
-    {
-        202: "WARNING",  # order canceled
-        504: "DEBUG",  # not connected -- always thrown on start
-        2103: "WARNING",  # datafarm connection broken
-        2104: "DEBUG",  # Market data farm connection is OK
-        2106: "DEBUG",  # A historical data farm is connected.
-        2108: "DEBUG",  # data hiccup
-        2158: "DEBUG",  # A historical data farm is connected.
-    }
-)
 
-assert not set(PERMIT_ERROR.values()) - {"DEBUG", "INFO", "WARNING"}
-
-
-# noinspection SpellCheckingInspection
-def init_sec_logger() -> Logger:
-    seclog = getLogger("FINSEC")
-    seclog.setLevel(INFO)
-    seclog.addHandler(StreamHandler(sys.stderr))
-    seclog.handlers[0].setFormatter(
-        Formatter(
-            color("yellow", "{asctime} SEC-{levelname} ∷ {message}"),
-            style="{",
-        )
-    )
-    return seclog
-
-
-LOG = init_sec_logger()
-
-
-class SecurityFault(Exception):
+class SecBoundsError(SecError):
     """
     This exception is raised whenever a dangerous operation is blocked by user
     or automatic intervention.
     """
-
-
-T = TypeVar("T")
 
 
 @dataclass(frozen=True)  # type: ignore
@@ -89,7 +37,7 @@ class ThreeTierGeneric(Generic[T]):
             )
         )
         if ans != "YES":
-            raise SecurityFault(self.confirm_msg)
+            raise SecBoundsError(self.confirm_msg)
 
     def validate(self, val: T) -> T:
         if self.cmp_op(val, self.block_level):  # type: ignore
@@ -98,7 +46,7 @@ class ThreeTierGeneric(Generic[T]):
                 f"{self.fmt_val(val)} {self.fmt_op()} {self.block_level}) "
                 "rejected by rule."
             )
-            raise SecurityFault(self.confirm_msg)
+            raise SecBoundsError(self.confirm_msg)
         if self.cmp_op(val, self.confirm_level):  # type: ignore
             self._confirm_danger(val)
             LOG.warning(
@@ -128,9 +76,6 @@ class ThreeTierGeneric(Generic[T]):
         """
         :return:  a string representation of the operator
         """
-
-
-N = TypeVar("N", int, float)
 
 
 @dataclass(frozen=True)
@@ -200,7 +145,7 @@ class Policy:
         "MISALLOCATION", 3e-3, 1e-3, 3e-4, "Misallocated portfolio."
     )
     ORDER_QTY = ThreeTierNMax("ORDER SIZE", 250, 100, 50, "Large order size.")
-    ORDER_TOTAL = ThreeTierNMax(
+    PER_ACCT_ORDER_TOTAL = ThreeTierNMax(
         "ORDER TOTAL", 50000.0, 5000.0, 1000.0, "Large order amount."
     )
     MISALLOC_DOLLARS = ThreeTierNMin(
@@ -225,15 +170,3 @@ class Policy:
 
     MAX_PRICING_AGE = 20  # seconds
     MAX_ACCT_SUM_AGE = 120  # seconds
-
-
-def audit_order(order: Order) -> Order:
-
-    succ = order.orderType == "MIDPRICE"
-    succ &= config()["app"].getboolean("armed") or not order.transmit
-    succ &= not order.outsideRth
-
-    assert succ, f"{order} failed audit."
-
-    order._audited = True
-    return order

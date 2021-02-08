@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 secrets
-data
+/data
 lib
 /autorebalance.ini
 
@@ -101,3 +101,5 @@ ENV/
 .venv/
 /.venv/
 /.dmypy.json
+/autorebalance.yaml
+/autorebalance.yaml.bkp

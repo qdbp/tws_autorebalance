@@ -31,8 +31,8 @@ def get_loan_at_target_utilization(
         → L = q * t * ewlv / (1 - t * q)
     """
 
-    assert 0 < margin_req < 1
-    assert target_utilization < 1
+    assert 0 < margin_req <= 1
+    assert target_utilization <= 1
 
     q = 1 - margin_req
     t = target_utilization

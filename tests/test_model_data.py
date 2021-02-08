@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pytest import raises
 
-from src.model.data import Position, Trade
+from src.model.data.trades import Position, Trade
 
 
 def test_position() -> None:

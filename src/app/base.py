@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from enum import Enum, auto
 from functools import wraps
 from logging import INFO, Logger, StreamHandler, getLogger
 from threading import Event, Lock, Thread, current_thread
@@ -30,6 +31,11 @@ class HeartBeat:
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, HeartBeat) and self.id == other.id
+
+
+class WorkerStatus(Enum):
+    SUCCESS = auto()
+    ERROR = auto()
 
 
 class TWSApp(EClient, EWrapper):  # type: ignore
@@ -65,9 +71,10 @@ class TWSApp(EClient, EWrapper):  # type: ignore
 
     def start_worker(
         self,
-        worker_method: Callable[[], bool],
+        worker_method: Callable[[], WorkerStatus],
         delay: float,
-        suppress: tuple[Type[Exception], ...] = (),
+        ignore_exc: tuple[Type[Exception], ...] = (),
+        suppress_exc: tuple[Type[Exception], ...] = (),
         hb_period: Opt[float] = None,
     ) -> Thread:
         """
@@ -91,9 +98,15 @@ class TWSApp(EClient, EWrapper):  # type: ignore
             delay: the amount of time to wait between each execution of the
                 worker. As implemented this is a simple sleep, so the actual
                 delay between invocations will be delay + execution time.
-            suppress: a list of exception types which will be caught and
-                suppressed with a warning in the worker thread. Other exceptions
-                are considered fatal and will result in app shutdown.
+            ignore_exc: a list of exception types which will be caught and
+                ignored, and will not be considered a worker failure for the
+                heartbeat.
+            suppress_exc: a list of exception types that will be caught and
+                logged with a warning. These will be considered a worker
+                failure, but will not trigger app shutdown except potentially by
+                causing a heartbeat timeout.
+                Exceptions that are neither ignored nor suppressed are
+                considered fatal and will result in app shutdown.
             hb_period: an optional float. If not None, this will request that a
                 monitor thread regularly check that the worker has not failed to
                 execute for at least this many seconds. If this check fails,
@@ -125,20 +138,23 @@ class TWSApp(EClient, EWrapper):  # type: ignore
             while not app._workers_halt.is_set():
                 # noinspection PyBroadException
                 try:
-                    success = worker_method()
-                except suppress as e:
+                    status = worker_method()
+                except ignore_exc as e:
+                    app.log.debug(f"Ignored {e} in {worker_method.__name__}")
+                    status = WorkerStatus.SUCCESS
+                except suppress_exc as e:
                     app.log.warning(
-                        f"Suppressed exception {e} in {worker_method.__name__}."
+                        f"Suppressed {e} in {worker_method.__name__}."
                     )
-                    success = False
+                    status = WorkerStatus.ERROR
                 except Exception as e:
                     app.log.critical(
-                        f"Uncaught exception {e} in {worker_method.__name__}"
+                        f"Uncaught {e} in {worker_method.__name__}"
                     )
                     app.shut_down()
                     raise
 
-                if hb_period is not None and success:
+                if hb_period is not None and status == WorkerStatus.SUCCESS:
                     self._heartbeats[hb_key].ts = utime()
 
                 if delay == 0.0:
@@ -200,14 +216,14 @@ class TWSApp(EClient, EWrapper):  # type: ignore
             self.clean_up()
             self._has_shut_down.set()
 
-    def heartbeat_worker(self) -> bool:
+    def heartbeat_worker(self) -> WorkerStatus:
         for hb_key, hb in self._heartbeats.items():
             if utime() > hb.ts + hb.period:
                 self.log.critical(
                     color("red", f"Watchdog timeout for '{hb.name}'. Fatal.")
                 )
                 self.shut_down()
-        return True
+        return WorkerStatus.SUCCESS
 
 
 def worker_thread(method: Callable[[], None]) -> Thread:

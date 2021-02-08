@@ -5,25 +5,20 @@ from typing import Literal, Optional
 
 import numpy as np
 import pulp
-from pulp import COIN, LpInteger, LpMinimize, LpProblem, LpStatus
+from pulp import COIN, LpInteger, LpProblem, LpStatus
 from pulp_lparray import lparray
 
-from src import security as sec
+import src.security.bounds
 from src.model.calc_primitives import shrink
-from src.model.data import (
-    Composition,
-    Position,
-    ProfitAttribution,
-    SimpleContract,
-    Trade,
-)
+from src.model.data import Composition, SimpleContract
+from src.model.data.trades import Position, ProfitAttribution, Trade
 
 
 class PortfolioSolverError(Exception):
     pass
 
 
-def find_closest_portfolio(
+def find_closest_positions(
     funds: float,
     composition: Composition,
     prices: dict[SimpleContract, float],
@@ -89,7 +84,7 @@ def find_closest_portfolio(
         raise KeyboardInterrupt
 
     normed_misalloc = loss.value() / funds
-    sec.Policy.MISALLOCATION.validate(normed_misalloc)
+    src.security.bounds.Policy.MISALLOCATION.validate(normed_misalloc)
 
     return {c: int(v) for c, v in zip(composition.contracts, alloc.values)}
 
@@ -201,7 +196,7 @@ def calculate_profit_attributions(
     sell_qty_limit = np.array([-t.qty for t in sells], dtype=np.uint32)
     buy_qty_limit = np.array([t.qty for t in buys], dtype=np.uint32)
 
-    prob = LpProblem(sense=LpMinimize)
+    prob = LpProblem()
 
     match: lparray = lparray.create_anon(
         "Match", (nb, ns), cat=LpInteger, lowBound=0
