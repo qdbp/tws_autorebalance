@@ -1,30 +1,32 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum, auto
 from functools import wraps
-from logging import INFO, Logger, StreamHandler, getLogger
-from threading import Event, Lock, Thread, current_thread
+from logging import DEBUG, INFO, FileHandler, Logger, StreamHandler, getLogger
+from threading import Event, Thread, current_thread
 from time import time as utime
 from typing import Callable
 from typing import Optional as Opt
-from typing import Type
+from typing import Type, final
 from uuid import UUID, uuid4
 
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from py9lib.log import get_nice_formatter
 
+from src import PROJECT_ROOT
 from src.util.format import color
 
 
 @dataclass()
 class HeartBeat:
-    id: UUID
     name: str
     ts: float
     period: float
+    id: UUID = field(default_factory=uuid4, init=False)
 
     def __hash__(self) -> int:
         return hash(self.id)
@@ -55,20 +57,15 @@ class TWSApp(EClient, EWrapper):  # type: ignore
         self.client_id = client_id
         TWSApp.IDS.add(client_id)
 
-        self.log = self._set_up_log()
-        self.log.setLevel(log_level)
+        self.log = self._set_up_log(log_level)
 
         self._initialized = Event()
-        self._workers_halt = Event()
+        self.killswitch = Event()
+
         self._worker_threads: set[Thread] = set()
-
-        self._has_shut_down = Event()
-        self._shutdown_lock = Lock()
-
         self._heartbeats: dict[UUID, HeartBeat] = {}
 
-        self.start_worker(self.heartbeat_worker, 1.0)
-
+    @final
     def start_worker(
         self,
         worker_method: Callable[[], WorkerStatus],
@@ -125,43 +122,45 @@ class TWSApp(EClient, EWrapper):  # type: ignore
         assert delay >= 0.0
 
         if hb_period is not None:
-            hb_key: UUID = uuid4()
-            self._heartbeats[hb_key] = HeartBeat(
-                hb_key, worker_method.__name__, utime(), hb_period
-            )
+            hb = HeartBeat(worker_method.__name__, utime(), hb_period)
+            self._heartbeats[hb.id] = hb
 
         # kwargs to avoid late binding issues -- should not be used.
         @wraps(worker_method)
         def _worker() -> None:
-
             last_scheduled = utime()
-            while not app._workers_halt.is_set():
+            while not app.killswitch.is_set():
                 # noinspection PyBroadException
                 try:
                     status = worker_method()
                 except ignore_exc as e:
-                    app.log.debug(f"Ignored {e} in {worker_method.__name__}")
+                    app.log.debug(
+                        f"Ignored {e} in {worker_method.__name__}",
+                        stacklevel=2,
+                    )
                     status = WorkerStatus.SUCCESS
                 except suppress_exc as e:
                     app.log.warning(
-                        f"Suppressed {e} in {worker_method.__name__}."
+                        f"Suppressed '{e}' in {worker_method.__name__}.",
+                        stacklevel=2,
                     )
                     status = WorkerStatus.ERROR
                 except Exception as e:
                     app.log.critical(
-                        f"Uncaught {e} in {worker_method.__name__}"
+                        msg := f"Uncaught {e} in {worker_method.__name__}",
+                        stacklevel=2,
                     )
-                    app.shut_down()
+                    app.kill(msg)
                     raise
 
                 if hb_period is not None and status == WorkerStatus.SUCCESS:
-                    self._heartbeats[hb_key].ts = utime()
+                    self._heartbeats[hb.id].ts = utime()
 
                 if delay == 0.0:
                     continue
                 else:
                     next_scheduled = last_scheduled + delay
-                    app._workers_halt.wait(
+                    app.killswitch.wait(
                         timeout=max(0.001, next_scheduled - utime())
                     )
                     last_scheduled = next_scheduled
@@ -172,14 +171,27 @@ class TWSApp(EClient, EWrapper):  # type: ignore
         self._worker_threads.add(thread)
         return thread
 
-    def _set_up_log(self) -> Logger:
+    def _set_up_log(self, level: int) -> Logger:
         log = getLogger(self.__class__.__name__)
-        log.setLevel(INFO)
+        log.setLevel(DEBUG)
         log.handlers.clear()
-        log.addHandler(StreamHandler(sys.stdout))
-        log.handlers[0].setFormatter(get_nice_formatter())
+
+        sh = StreamHandler(sys.stdout)
+        sh.setLevel(level)
+        sh.setFormatter(get_nice_formatter())
+        log.addHandler(sh)
+
+        fh = FileHandler(
+            PROJECT_ROOT / f"arb_{datetime.now().date().isoformat()}.txt",
+            mode="a",
+        )
+        fh.setLevel(DEBUG)
+        fh.setFormatter(get_nice_formatter())
+        log.addHandler(fh)
+
         return log
 
+    @final
     def nextValidId(self, oid: int) -> None:
         if not self._initialized.is_set():
             self._initialized.set()
@@ -192,37 +204,64 @@ class TWSApp(EClient, EWrapper):  # type: ignore
         used after the initialization call.
         """
 
+    @final
     def ez_connect(self) -> None:
         super().connect("127.0.0.1", self.TWS_DEFAULT_PORT, self.client_id)
         worker_thread(self.run).start()
         self._initialized.wait()
+        self.log.debug("Connection initialization completed.")
+
+    def spin_up(self) -> None:
+        self.start_worker(self.heartbeat_worker, 1.0)
 
     def clean_up(self) -> None:
-        self._workers_halt.set()
-        if self.isConnected():
-            self.disconnect()
+        self.killswitch.set()
         for thread in self._worker_threads:
             if thread is current_thread():
                 continue
             self.log.debug(f"Waiting on {thread}...")
             thread.join()
+        if self.isConnected():
+            self.disconnect()
         TWSApp.IDS.remove(self.client_id)
 
-    def shut_down(self) -> None:
-        with self._shutdown_lock:
-            if self._has_shut_down.is_set():
-                return
-            self.log.info(f"Shutting down @{TWSApp.__name__}")
-            self.clean_up()
-            self._has_shut_down.set()
+    @final
+    def launch(self) -> None:
+        """
+        Entry point into the application, launching workers.
 
+        The application is expected to run as:
+
+            INIT -launch()-> RUNNING
+                    |-> C.spin_up(self) for C in mro from base to self.class
+
+            RUNNING -killswitch.wait()-> TEARDOWN
+
+            TEARDOWN -C.clean_up()->
+                        |for C in mro from self.class to base
+
+        TEARDOWN is irreversible and no attempt must be made to reuse the
+        app object.
+        """
+
+        try:
+            self.spin_up()
+            self.killswitch.wait()
+        finally:
+            self.clean_up()
+
+    @final
+    def kill(self, msg: str) -> None:
+        self.log.critical(color("red_1", f"Killed: {msg}"))
+        self.killswitch.set()
+
+    @final
     def heartbeat_worker(self) -> WorkerStatus:
         for hb_key, hb in self._heartbeats.items():
             if utime() > hb.ts + hb.period:
-                self.log.critical(
-                    color("red", f"Watchdog timeout for '{hb.name}'. Fatal.")
-                )
-                self.shut_down()
+                msg = f"Watchdog timeout for '{hb.name}'. Fatal."
+                self.log.critical(color("red", msg))
+                self.kill(msg)
         return WorkerStatus.SUCCESS
 
 

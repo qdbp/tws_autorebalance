@@ -97,6 +97,7 @@ class SimpleOrder:
     num_shares: int
     limit_price: float
     gtd: datetime
+    transmit: bool
     raw_order: Order = None
 
     def __post_init__(self) -> None:
@@ -113,6 +114,7 @@ class SimpleOrder:
         order.lmtPrice = self.limit_price
         order.tif = "GTD"
         order.goodTillDate = self.gtd.strftime(TWS_GTD_FORMAT)
+        order.transmit = self.transmit
         return order
 
     @classmethod
@@ -124,6 +126,7 @@ class SimpleOrder:
             limit_price=order.lmtPrice,
             gtd=datetime.strptime(order.goodTillDate, TWS_GTD_FORMAT),
             raw_order=order,
+            transmit=order.transmit,
         )
 
 
@@ -192,27 +195,32 @@ class Composition:
         Args:
             entries: the composition list to parse. Should conform to
                 the schema.
+
+        Returns:
+            (current composition, goal composition)
         """
 
-        base_comp = {
+        target_comp = {
             SimpleContract(item["ticker"].upper(), item["pex"]): item.get(
                 "target", item["pct"]
             )
+            / 100.0
             for item in entries
         }
-        target_comp = {
+        base_comp = {
             SimpleContract(item["ticker"].upper(), item["pex"]): item["pct"]
+            / 100.0
             for item in entries
         }
 
         comp = cls.from_dict(base_comp)
         target = cls.from_dict(target_comp)
 
-        if sum(base_comp.values()) != 1.0:
+        if sum(target_comp.values()) != 1.0:
             LOG.warning(
                 f"Configured composition does not sum to 1.0 -- will be normed!"
             )
-        if sum(target_comp.values()) != 1.0:
+        if sum(base_comp.values()) != 1.0:
             LOG.warning(
                 f"Configured target composition does not sum to 1.0 "
                 f"-- will be normed!"
@@ -330,5 +338,5 @@ class Composition:
                     / shoftfall_total
                 )
 
-        assert sum(pre_alloc.values()) == 1.0
+        assert np.isclose(sum(pre_alloc.values()), 1.0)
         return Composition.from_dict(pre_alloc)

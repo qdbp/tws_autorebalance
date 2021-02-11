@@ -1,10 +1,10 @@
 pulp==2.4
 colored==1.4.2
-numpy==1.20.0
+numpy==1.20.1
 python-dateutil==2.8.1
 matplotlib==3.3.4
-pandas==1.2.1
+pandas==1.2.2
 pyyaml==5.4.1
 
 git+https://github.com/qdbp/pulp-lparray.git@v1.0.0
-git+https://github.com/qdbp/py9lib.git@c7df26e
+git+https://github.com/qdbp/py9lib.git@f3acb2c

@@ -16,6 +16,7 @@ class AutoRebalanceConfig:
     # orders
     order_timeout: int
     max_slippage: float
+    min_trade_amt: float
     rebalance_freq: float
     liveness_timeout: float
     armed: bool
@@ -33,7 +34,7 @@ class AutoRebalanceConfig:
         strategy = raw_config["strategy"]
 
         acct_configs = {
-            acct_dict[acct]: AutoRebalanceAcctConfig.from_dict(acct_dict)
+            acct: AutoRebalanceAcctConfig.from_dict(acct, acct_dict)
             for acct, acct_dict in strategy["accounts"].items()
         }
 
@@ -73,13 +74,10 @@ class AutoRebalanceAcctConfig:
     # margin
     margin: Optional[AutoRebalanceMarginConfig]
 
-    def __post_init__(self) -> None:
-        f: Field[Any]
-        for f in fields(self):
-            assert getattr(self, f.name) is not None
-
     @classmethod
-    def from_dict(cls, acct_dict: dict[str, Any]) -> AutoRebalanceAcctConfig:
+    def from_dict(
+        cls, acct: Acct, acct_dict: dict[str, Any]
+    ) -> AutoRebalanceAcctConfig:
         """
         Constructs an account composition from an account sub-dict.
         """
@@ -89,6 +87,7 @@ class AutoRebalanceAcctConfig:
         )
 
         return AutoRebalanceAcctConfig(
+            acct=acct,
             composition=comp,
             goal_composition=target,
             margin=(

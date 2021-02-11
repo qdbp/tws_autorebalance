@@ -14,28 +14,28 @@ def shrink(x: int, d: int) -> int:
     return sgn(x) * (abs(x) - d)
 
 
-def get_loan_at_target_utilization(
-    ewlv: float, margin_req: float, target_utilization: float
+def get_loan_at_target_usage(
+    ewlv: float, margin_req: float, target_usage: float
 ) -> float:
     """
     Calculates the loan value with current position value at a given target
-    margin utilization.
+    margin usage.
 
     Let
         q := 1 - margin_req
     Let
-        t := target margin utilization = L / (q * gpv(L))
+        t := target margin usage = L / (q * gpv(L))
 
     Then:
-          L = t * q * (ewlv + L)
-        → L = q * t * ewlv / (1 - t * q)
+          L = t * q * (equity + L)
+        → L = q * t * equity / (1 - t * q)
     """
 
     assert 0 < margin_req <= 1
-    assert target_utilization <= 1
+    assert target_usage < 1
 
     q = 1 - margin_req
-    t = target_utilization
+    t = target_usage
 
     loan = q * t * ewlv / (1 - t * q)
 

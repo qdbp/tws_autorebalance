@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import gc
 import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from logging import DEBUG, INFO
 from queue import Full, Queue
 from time import sleep
 from time import time as utime
@@ -14,9 +16,9 @@ from ibapi.common import TickerId
 from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.order_state import OrderState
-from py9lib.errors import runtime_assert, value_assert
+from py9lib.errors import value_assert
 
-from src import ConfigWriteback
+from src import PROJECT_ROOT, ConfigWriteback
 from src.app.autorebalance.config import AutoRebalanceConfig
 from src.app.base import TWSApp, WorkerStatus
 from src.model import Acct
@@ -25,19 +27,22 @@ from src.model.calc import (
     calc_relative_misallocation,
     find_closest_positions,
 )
-from src.model.calc_primitives import (
-    is_market_open,
-    secs_until_market_open,
-    sgn,
-)
+from src.model.calc_primitives import secs_until_market_open, sgn
 from src.model.constants import TZ_EASTERN
 from src.model.data import OHLCBar, SimpleContract, SimpleOrder
 from src.model.data.margin import MarginState
-from src.model.data.order_manager import OMState, OMTombstone, OrderManager
+from src.model.data.order_manager import (
+    OMRecord,
+    OMState,
+    OMTombstone,
+    OrderManager,
+)
 from src.security import PERMIT_ERROR
 from src.security.bounds import Policy
 from src.security.liveness import LivenessError
 from src.util.format import color, pp_order
+
+REBALANCE_STATUS_FILE = (PROJECT_ROOT / "rebalance_status.txt").absolute()
 
 
 @dataclass()
@@ -54,8 +59,6 @@ class AcctState:
     rebalance_target: dict[SimpleContract, int] = field(default_factory=dict)
     acc_sum_acc: dict[str, float] = field(default_factory=dict)
     position_acc: dict[SimpleContract, int] = field(default_factory=dict)
-
-    # helpers
 
     def get_position(self, sc: SimpleContract, strict: bool = True) -> int:
         if self._unsafe_positions is None or (
@@ -95,7 +98,13 @@ class AutoRebalanceApp(TWSApp):
         self._unsafe_prices: dict[SimpleContract, OHLCBar] = {}
 
         # per-account state variables
-        self.st: dict[Acct, AcctState] = {}
+        self.acct_st: dict[Acct, AcctState] = {}
+
+        # startup progression barriers
+        self.acct_st_init_event = threading.Event()
+
+        # i/o
+        self.status_file = open(REBALANCE_STATUS_FILE, "w")
 
     # PROPERTIES
     @property
@@ -103,7 +112,7 @@ class AutoRebalanceApp(TWSApp):
         return list(self.conf.accounts)
 
     def empirical_allocation(
-        self, acct: Acct, ewlv: float
+        self, acct: Acct, equity: float
     ) -> dict[SimpleContract, float]:
         """
         Returns the current fractional allocation to each of the account's
@@ -111,8 +120,7 @@ class AutoRebalanceApp(TWSApp):
 
         Args:
             acct: the account for which to get the positions
-            ewlv: the current equity with loan value. This minus the total
-                position dollar amounts
+            equity: the account equity: positions plus positive cash
 
         Returns:
             a dict representing the current fractional composition, implicitly
@@ -120,41 +128,59 @@ class AutoRebalanceApp(TWSApp):
             (i.e. sum() == 1) otherwise.
         """
 
-        acct_st = self.st[acct]
+        acct_st = self.acct_st[acct]
         # strict=False allows us to open new positions just by editing the
         # config and giving them target percentages
         dollar_alloc = {
-            sc: acct_st.get_position(sc, strict=False) * self.get_price(sc)
+            sc: acct_st.get_position(sc, strict=False) * self.get_live_price(sc)
             for sc in self.conf.accounts[acct].composition.contracts
         }
 
-        # if ewlv > sum(dollar_alloc), that means we have net cash, and we
+        # if equity > sum(dollar_alloc), that means we have net cash, and we
         # want that reflected in the output for adjustment purposes. However,
         # we want the fractions to sum to at most 1 to conform to the
         # Composition adjustment algorithm requirements.
         tot = sum(dollar_alloc.values())
         return {
-            sc: alloc / max(ewlv, tot) for sc, alloc in dollar_alloc.items()
+            sc: alloc / max(equity, tot) for sc, alloc in dollar_alloc.items()
         }
 
-    def get_price(self, sc: SimpleContract) -> float:
-        age = self.sc_price_age(sc)
+    def get_price_age(self, sc: SimpleContract) -> float:
+        """
+        Returns the age of the price we have for an sc.
+
+        Infinite if no price.
+        """
+        if (bar := self._unsafe_prices.get(sc, None)) is None:
+            return float("inf")
+        return utime() - bar.t
+
+    def get_live_price(self, sc: SimpleContract) -> float:
+        age = self.get_price_age(sc)
         if age > Policy.MAX_PRICING_AGE:
             raise LivenessError(f"Stale price for {sc}.")
         return self._unsafe_prices[sc].c
+
+    def subscribe_to_prices(self, sc: SimpleContract) -> None:
+        if sc not in self.price_watchers.values():
+            req_id = self.PORTFOLIO_PRICE_REQ_ID + len(self.price_watchers)
+            self.log.debug(
+                f"Subscribing ({req_id=}) to _unsafe_prices for {sc.symbol}."
+            )
+            self.price_watchers[req_id] = sc
+            self.reqRealTimeBars(req_id, sc.contract, 60, "MIDPOINT", True, [])
+
+    # WRAPPER IMPLEMENTATIONS
 
     def next_requested_id(self, oid: int) -> None:
         try:
             self.order_id_queue.put_nowait(oid)
         except Full:
-            self.kill_app("Full order queue -- should not be possible.")
-
-    # WRAPPER IMPLEMENTATIONS
+            self.kill("Full order queue -- should not be possible.")
 
     def accountSummary(
         self, req_id: int, acct: Acct, tag: str, value: str, currency: str
     ) -> None:
-
         if acct not in self.accts:
             self.log.warning(
                 f"Got info for account {acct} I don't know about."
@@ -162,15 +188,17 @@ class AutoRebalanceApp(TWSApp):
             )
             return
 
-        if (st := self.st.get(acct)) is None:
+        if acct not in self.acct_st:
             acct_cfg = self.conf.accounts[acct]
-            st = self.st[acct] = AcctState(
+            self.acct_st[acct] = AcctState(
                 seen_ath=acct_cfg.margin.dd_reference_ath
                 if acct_cfg.margin is not None
                 else None
             )
+            for sc in acct_cfg.composition.contracts:
+                self.subscribe_to_prices(sc)
 
-        st.acc_sum_acc[tag] = float(value)
+        self.acct_st[acct].acc_sum_acc[tag] = float(value)
 
     def accountSummaryEnd(self, req_id: int) -> None:
         """
@@ -179,38 +207,37 @@ class AutoRebalanceApp(TWSApp):
         Currently, this only does anything useful for margin-using
         accounts.
         """
-
-        for acct, st in self.st.items():
+        for acct in self.accts:
+            st = self.acct_st[acct]
             acct_conf = self.conf.accounts[acct]
-
             acct_data = st.acc_sum_acc.copy()
             st.acc_sum_acc.clear()
 
             gpv = acct_data["GrossPositionValue"]
-            ewlv = acct_data["EquityWithLoanValue"]
+            cash = acct_data["TotalCashValue"]
 
             if acct_conf.margin is None:
-                runtime_assert(gpv == ewlv)
-                st.margin = MarginState.of_acct_without_margin(gpv)
+                st.margin = MarginState.of_acct_without_margin(gpv, cash)
             else:
                 # the TIMS margin requirement as reported by TWS
-                # r0 / gpv is treated as an alternative minimum margin
+                # maint_amt / gpv is treated as an alternative minimum margin
                 # requirement
-                r0 = acct_data["MaintMarginReq"]
+                min_maint_amt = acct_data["MaintMarginReq"]
                 st.margin = MarginState(
                     gpv=gpv,
-                    ewlv=ewlv,
-                    r0=r0,
+                    cash=cash,
+                    min_maint_amt=min_maint_amt,
                     min_margin_req=acct_conf.margin.min_margin_req,
                 )
 
             self.log.debug(
                 f"Got acct. info: "
-                f"margin util. = {st.margin.margin_utilization:%}, "
+                f"margin util. = {st.margin.margin_usage:%}, "
                 f"margin req. = {st.margin.margin_req:%}, "
                 f"GPV={st.margin.gpv / 1000:.1f}k, "
-                f"EwLV={st.margin.ewlv / 1000:.1f}k."
+                f"LOAN={st.margin.loan / 1000:.1f}k."
             )
+        self.acct_st_init_event.set()
 
     def error(
         self, req_id: TickerId, error_code: int, error_string: str
@@ -220,7 +247,7 @@ class AutoRebalanceApp(TWSApp):
         )
         # pacing violation
         if error_code == 420:
-            self.kill_app(color("green", "🌿 error 420 🌿 you need to chill 🌿"))
+            self.kill(color("green", "🌿 error 420 🌿 you need to chill 🌿"))
         elif error_code in PERMIT_ERROR:
             {
                 "DEBUG": self.log.debug,
@@ -228,7 +255,7 @@ class AutoRebalanceApp(TWSApp):
                 "WARNING": self.log.warning,
             }[PERMIT_ERROR[error_code]](msg)
         else:
-            self.kill_app(msg)
+            self.kill(msg)
 
     def openOrder(
         self,
@@ -299,30 +326,31 @@ class AutoRebalanceApp(TWSApp):
             )
 
         if status == "Filled":
-            self.order_manager.finalize_order(oid)
-            self.log.info(
-                color(
-                    "green",
-                    f"Order for "
-                    f"{pp_order(rec.sc.contract, rec.order)} filled.",
+            if self.order_manager.finalize_order(oid):
+                self.log.info(
+                    color(
+                        "green",
+                        f"Order for "
+                        f"{pp_order(rec.sc.contract, rec.order)} filled.",
+                    )
                 )
-            )
-            self.reqPositions()
-            return
+                self.reqPositions()
+                return
 
         elif status == "Cancelled":
-            self.order_manager.finalize_order(oid)
-            self.log.info(
-                color(
-                    "dark_orange",
-                    f"Order "
-                    f"{pp_order(rec.sc.contract, rec.order)} "
-                    f"canceled.",
+            if self.order_manager.finalize_order(oid):
+                self.log.info(
+                    color(
+                        "dark_orange",
+                        f"Order "
+                        f"{pp_order(rec.sc.contract, rec.order)} "
+                        f"canceled.",
+                    )
                 )
-            )
-            if filled_qty > 0:
-                self.reqPositions()
-            return
+                rec = self.order_manager.get_record(oid)
+                if filled_qty > 0:
+                    self.reqPositions()
+                return
 
         else:
             self.log.debug(
@@ -349,41 +377,35 @@ class AutoRebalanceApp(TWSApp):
         # we might have a fractional position -- round it for trading
         int_pos = round(pos)
         if int_pos != 0:
-            self.st[acct].position_acc[sc] = int_pos
+            self.acct_st[acct].position_acc[sc] = int_pos
+
+    # PROPERTIES
 
     def positionEnd(self) -> None:
         msg = "Received new positions. Totals: "
         for acct in self.accts:
-            acct_st = self.st[acct]
+            acct_st = self.acct_st[acct]
             acct_cfg = self.conf.accounts[acct]
 
             pos_data = acct_st.position_acc.copy()
             acct_st.position_acc.clear()
 
-            msg += f"{acct}:{sum(pos_data.values())} "
+            msg += f"[{acct}]: {sum(pos_data.values())} "
 
-            for sc, pos in pos_data.items():
-                acct_st.set_position(sc, pos)
+            for sc in pos_data:
                 if sc not in acct_cfg.composition.contracts:
                     self.log.critical(f"Unknown portfolio keys in {acct}: {sc}")
                     self.log.critical("This might be a bad primary exchange.")
-                    self.kill_app("Unknown portfolio keys received.")
-
-                if sc in self.price_watchers.values():
+                    self.kill("Unknown portfolio keys received.")
                     continue
 
-                req_id = self.PORTFOLIO_PRICE_REQ_ID + len(self.price_watchers)
-                self.log.debug(
-                    f"Subscribing ({req_id=}) to prices for {sc.symbol}."
-                )
-                self.price_watchers[req_id] = sc
-                self.reqRealTimeBars(
-                    req_id, sc.contract, 60, "MIDPOINT", True, []
-                )
+            for sc in acct_cfg.composition.contracts:
+                if sc in pos_data:
+                    acct_st.set_position(sc, pos_data[sc])
+                else:
+                    acct_st.set_position(sc, 0)
 
         self.log.info(msg)
-
-    # PROPERTIES
 
     def realtimeBar(
         self,
@@ -396,45 +418,10 @@ class AutoRebalanceApp(TWSApp):
         *_: Any,
     ) -> None:
         if (contract := self.price_watchers.get(req_id)) is not None:
-            self.log.debug(f"Received price for {contract.symbol}: {c:.2f}")
+            # self.log.debug(f"Received price for {contract.symbol}: {c:.2f}")
             self._unsafe_prices[contract] = OHLCBar(t, o, h, l, c)
         else:
-            self.kill_app(f"Received unsolicited price {req_id=}")
-
-    def acct_price_age(self, acct: Acct) -> float:
-        """
-        Gets the oldest contract price age for scs in that account's comp.
-        """
-        age = 0.0
-        for sc in self.conf.accounts[acct].composition.contracts:
-            return max(age, self.sc_price_age(sc))
-        return age
-
-    def sc_price_age(self, sc: SimpleContract) -> float:
-        """
-        Returns the age of the price we have for an sc.
-
-        Infinite if no price.
-        """
-        if (bar := self._unsafe_prices.get(sc)) is None:
-            return float("inf")
-        return utime() - bar.t
-
-    def is_live(self, acct: Acct) -> bool:
-        """
-        A flag representing whether we have received sufficient information to
-        start making trading decisions for an account.
-
-        True means enough information.
-        """
-        # noinspection PyUnboundLocalVariable
-        # https://youtrack.jetbrains.com/issue/PY-46874
-        return (
-            is_market_open()
-            and (margin := self.st[acct].margin) is not None
-            and margin.age < Policy.MAX_ACCT_SUM_AGE
-            and self.acct_price_age(acct) < Policy.MAX_PRICING_AGE
-        )
+            self.kill(f"Received unsolicited price {req_id=}")
 
     # REBALANCE STRATEGY IMPL
 
@@ -444,11 +431,12 @@ class AutoRebalanceApp(TWSApp):
         if acct_cfg.margin is None:
             raise RuntimeError("Trying to get drawdown for no margin account.")
 
-        acct_state = self.st[acct]
+        acct_state = self.acct_st[acct]
         composition = acct_cfg.composition
 
         port_price = sum(
-            composition[sc] * self.get_price(sc) for sc in composition.contracts
+            composition[sc] * self.get_live_price(sc)
+            for sc in composition.contracts
         )
 
         out = 1 - port_price / acct_cfg.margin.dd_reference_ath
@@ -499,7 +487,9 @@ class AutoRebalanceApp(TWSApp):
         orders = {}
         for acct in self.accts:
             total_amt = 0.0
-            for sc, num_contracts in self.st[acct].rebalance_target.items():
+            for sc, num_contracts in self.acct_st[
+                acct
+            ].rebalance_target.items():
                 order = SimpleOrder(
                     acct=acct,
                     num_shares=num_contracts,
@@ -513,19 +503,20 @@ class AutoRebalanceApp(TWSApp):
                     ),
                     gtd=datetime.now(TZ_EASTERN)
                     + timedelta(seconds=self.conf.order_timeout),
+                    transmit=self.conf.armed,
                 )
 
                 orders[sc] = order
-                total_amt += self.get_price(sc) * abs(num_contracts)
+                total_amt += self.get_live_price(sc) * abs(num_contracts)
 
             Policy.PER_ACCT_ORDER_TOTAL.validate(total_amt)
 
         return orders
 
     def increment_acct_composition_to_goal(
-        self, acct: Acct, ewlv: float
+        self, acct: Acct, equity: float
     ) -> None:
-        cur_alloc = self.empirical_allocation(acct, ewlv)
+        cur_alloc = self.empirical_allocation(acct, equity)
         acct_cfg = self.conf.accounts[acct]
 
         new_comp = acct_cfg.composition.update_toward_target(
@@ -538,12 +529,12 @@ class AutoRebalanceApp(TWSApp):
         self.conf.accounts[acct] = replace(acct_cfg, composition=new_comp)
 
         with ConfigWriteback() as conf:
-            for item in conf["strategy"]["account"][acct]["composition"]:
+            for item in conf["strategy"]["accounts"][acct]["composition"]:
                 # never write back items that are not adjusting
                 if "target" not in item:
                     continue
                 sc = SimpleContract(item["ticker"].upper(), item["pex"])
-                item["pct"] = new_comp[sc]
+                item["pct"] = round(100.0 * new_comp[sc], 4)
 
         self.log.debug(
             f"Updated {acct=} composition to {new_comp} using {cur_alloc}"
@@ -554,11 +545,8 @@ class AutoRebalanceApp(TWSApp):
         close_prices = {}
 
         for acct in self.accts:
-
             acct_cfg = self.conf.accounts[acct]
-
-            runtime_assert(acct in self.st)
-            acct_st = self.st[acct]
+            acct_st = self.acct_st[acct]
 
             if acct_st is None or acct_st.margin is None:
                 raise LivenessError(
@@ -566,41 +554,56 @@ class AutoRebalanceApp(TWSApp):
                 )
 
             target_mu = self.get_target_margin_use(acct)
-            target_loan = acct_st.margin.get_loan_at_utilization(target_mu)
-            funds = acct_st.margin.ewlv + target_loan
+            target_loan = acct_st.margin.get_loan_at_usage(target_mu)
+            funds = acct_st.margin.nlv + target_loan
 
             for sc in self.conf.accounts[acct].composition.contracts:
                 if sc not in close_prices:
-                    close_prices[sc] = self.get_price(sc)
+                    close_prices[sc] = self.get_live_price(sc)
 
             # this updates the configured composition in place for any
             # drifting allocations
-            self.increment_acct_composition_to_goal(acct, acct_st.margin.ewlv)
+            self.increment_acct_composition_to_goal(acct, acct_st.margin.equity)
 
             model_alloc = find_closest_positions(
-                funds, acct_cfg.composition, close_prices
+                funds,
+                acct_cfg.composition,
+                {
+                    sc: p
+                    for sc, p in close_prices.items()
+                    if sc in acct_cfg.composition.contracts
+                },
             )
 
             ideal_allocation_delta: dict[SimpleContract, tuple[int, float]] = {}
-
-            if acct_cfg.margin is None:
-                raise LivenessError(f"Margin state for {acct_cfg}")
 
             for sc in acct_cfg.composition.contracts:
                 target_alloc = model_alloc[sc]
                 cur_alloc = acct_st.get_position(sc)
                 price = close_prices[sc]
 
-                if (
-                    misalloc := calc_relative_misallocation(
-                        acct_st.margin.ewlv,
-                        price,
-                        cur_alloc,
-                        target_alloc,
-                        frac_coef=acct_cfg.misalloc_frac_coef,
-                        pvf_coef=acct_cfg.misalloc_pvf_coef,
-                    )
-                ) > 1.0:
+                # check if we are sufficiently misallocated to trade
+                rel_misalloc = calc_relative_misallocation(
+                    # equity includes only positive cash value, which gives
+                    # the desired behavior.
+                    acct_st.margin.equity,
+                    price,
+                    cur_alloc,
+                    target_alloc,
+                    frac_coef=acct_cfg.misalloc_frac_coef,
+                    pvf_coef=acct_cfg.misalloc_pvf_coef,
+                )
+
+                # check if our trade is large enough
+                rel_trade_size = (
+                    abs(target_alloc - cur_alloc)
+                    * price
+                    / self.conf.min_trade_amt
+                )
+
+                tradeability = min(rel_misalloc, rel_trade_size)
+
+                if tradeability >= 1.0:
                     acct_st.rebalance_target[sc] = target_alloc - cur_alloc
                 else:
                     acct_st.rebalance_target.pop(sc, None)
@@ -609,19 +612,25 @@ class AutoRebalanceApp(TWSApp):
                 if target_alloc != cur_alloc:
                     ideal_allocation_delta[sc] = (
                         target_alloc - cur_alloc
-                    ), misalloc
+                    ), rel_misalloc
 
-            ideal_fmt = ", ".join(
-                f"{sc.symbol}{sgn(delta) * misalloc:+2.0%}"
-                for sc, (delta, misalloc) in sorted(
+            status_str = f"[{acct}] "
+
+            if acct_cfg.margin is not None:
+                status_str += f"current mu: {acct_st.margin.margin_usage:.2%}, "
+                status_str += f"target mu: {target_mu:.2%} "
+
+            pos_line = ", ".join(
+                f"{sc.symbol}{sgn(delta) * tradeability:+2.0%}"
+                for sc, (delta, tradeability) in sorted(
                     ideal_allocation_delta.items(), key=lambda x: -x[1][1]
                 )
-                if abs(misalloc) > 0.5
+                if abs(tradeability) > 0.5
             )
-            msg = f"mu{target_mu:+.1%}: {ideal_fmt}"
-            msg += " " * (100 - len(msg))
-            print(msg, end="\r")
-            self.log.debug(msg)
+            if pos_line:
+                status_str += pos_line
+                self.status_file.write(status_str + "\n")
+                self.status_file.flush()
 
         orders = self.construct_rebalance_orders(close_prices)
 
@@ -635,7 +644,6 @@ class AutoRebalanceApp(TWSApp):
             self.safe_place_order(sc, order)
 
         self.log.debug(self.order_manager.format_book())
-
         return WorkerStatus.SUCCESS
 
     def clear_any_untransmitted_order(
@@ -676,8 +684,11 @@ class AutoRebalanceApp(TWSApp):
         if not entered:
             rec = self.order_manager.find_record(ib_order.account, sc)
             self.log.debug(
-                f"Order for {sc.symbol} rejected by manager: "
-                f"existing record {rec}."
+                color(
+                    "red_1",
+                    f"Order for {sc.symbol} rejected by manager: "
+                    f"existing record {rec}.",
+                )
             )
             return
         # ^ DO NOT REORDER THESE CALLS v
@@ -711,72 +722,64 @@ class AutoRebalanceApp(TWSApp):
         )
 
     def acct_update_worker(self) -> WorkerStatus:
+        self.log.debug("Requesting account summary for all accounts...")
         self.reqAccountSummary(
             self.ACCT_SUM_REQ_ID,
             "All",
-            "EquityWithLoanValue,GrossPositionValue,MaintMarginReq",
+            "GrossPositionValue,MaintMarginReq,TotalCashValue",
         )
         return WorkerStatus.SUCCESS
 
-    # NB despite how much stuff is now done "per-account", there should be
-    # a single worker -- the eventual goal is to allow cross-account
-    # strategies
-    # TODO currently this worker requires all accounts to be live to work
-    #   we can change this if we need to, but it will require effort in
-    #   the base class, I think
-
-    def kill_app(self, msg: str) -> None:
-        self.log.critical(color("red_1", f"Killed: {msg}"))
-        self.shut_down()
-
     def clean_up(self) -> None:
-        try:
-            for acct, acct_cfg in self.conf.accounts.items():
-                for sc in acct_cfg.composition.contracts:
-                    self.clear_any_untransmitted_order(acct, sc)
-        finally:
-            super().clean_up()
+        """
+        ONCE CALLED, OBJECT CANNOT BE RECOVERED AND MUST BE DISCARDED.
+        """
+        for oid, rec in self.order_manager:
+            if isinstance(rec, OMRecord) and rec.state == OMState.ENTERED:
+                self.cancelOrder(oid)
+        super().clean_up()
+        # close file after super cleanup, which halts the workers.
+        self.status_file.close()
 
-    def execute(self) -> None:
-        try:
-            self.log.info("I awaken. Greed is good!")
-            if self.conf.armed:
-                self.log.warning(color("red", "I am armed."))
-                self.log.warning(color("sandy_brown", "Coffee's on me ☕"))
+    def spin_up(self) -> None:
+        self.log.info("I awaken. Greed is good!")
+        super(AutoRebalanceApp, self).spin_up()
 
-            self.ez_connect()
-            self.start_worker(self.acct_update_worker, 60.0, hb_period=120.0)
-            self.reqPositions()
-            self.start_worker(
-                self.rebalance_worker,
-                self.conf.rebalance_freq,
-                hb_period=self.conf.liveness_timeout,
-                ignore_exc=(PortfolioSolverError,),
-                suppress_exc=(LivenessError,),
-            ).join()
+        if self.conf.armed:
+            self.log.warning(color("red", "I am armed."))
+            self.log.warning(color("sandy_brown", "Coffee's on me ☕"))
 
-        finally:
-            self.log.info("Disconnecting. I hope I didn't lose too much money!")
-            self.shut_down()
+        self.ez_connect()
+        self.start_worker(self.acct_update_worker, 20.0, hb_period=120.0)
+
+        self.acct_st_init_event.wait()
+
+        # DO NOT REORDER
+
+        self.reqPositions()
+        self.start_worker(
+            self.rebalance_worker,
+            self.conf.rebalance_freq,
+            hb_period=self.conf.liveness_timeout,
+            ignore_exc=(PortfolioSolverError,),
+            suppress_exc=(LivenessError,),
+        )
 
 
-def arb_entrypoint() -> None:
+def arb_entrypoint(debug: bool = False) -> None:
     while True:
         s = secs_until_market_open()
+        app = AutoRebalanceApp(log_level=INFO if not debug else DEBUG)
         if s > 5:
-            print(
-                f"Sleeping for {int(s)} seconds till markets open.",
-                file=sys.stderr,
-            )
-            sleep(s - 1)
-        app = AutoRebalanceApp()
+            app.log.info(f"Sleeping for {int(s)} seconds until markets open.")
+            sleep(s - 5)
         try:
-            app.execute()
+            app.launch()
         except Exception as e:
-            print(e)
+            app.log.critical(f"App exited with {e}.", exc_info=sys.exc_info())
         finally:
-            print("App exited. Relaunching in 5 secs.", file=sys.stderr)
-            for thread in threading.enumerate():
-                print(thread)
-            sleep(5)
+            app.log.error("Relaunching in 5 secs.")
+            del app
+            gc.collect()
+            sleep(15)
             continue

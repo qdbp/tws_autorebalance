@@ -425,5 +425,5 @@ class PriceLoaderApp(TWSApp):
         )
         self._prices_part_loaded.set()
 
-    def error(self, req_id: int, code: int, msg: str) -> None:
-        self.log.error(f"TWS error {req_id} -> {code} -> {msg}")
+    # def error(self, req_id: int, code: int, msg: str) -> None:
+    #     self.log.error(f"TWS error {req_id} -> {code} -> {msg}")

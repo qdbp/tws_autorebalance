@@ -96,6 +96,7 @@
         "rebalance_freq",
         "liveness_timeout"
       ],
+      "additionalProperties": false,
       "properties": {
         "armed": {
           "type": "boolean",
@@ -108,6 +109,11 @@
         "max_slippage": {
           "type": "number",
           "description": "Will execute orders only within this many dollars of the target price."
+        },
+        "min_trade_amt": {
+          "type": "number",
+          "minimum": 0.0,
+          "description": "Minimum dollar amount of trades to minimize attrition."
         },
         "rebalance_freq": {
           "type": "number",

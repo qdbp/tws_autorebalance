@@ -5,8 +5,9 @@ from typing import Literal, Optional
 
 import numpy as np
 import pulp
-from pulp import COIN, LpInteger, LpProblem, LpStatus
+from pulp import COIN, LpInteger, LpProblem, LpStatus, LpStatusInfeasible
 from pulp_lparray import lparray
+from py9lib.errors import ProgrammingError
 
 import src.security.bounds
 from src.model.calc_primitives import shrink
@@ -35,7 +36,7 @@ def find_closest_positions(
 
     :param funds: total amount of money available to spend on the portfolio.
     :param composition: the target composition to approximate
-    :param prices: the assumed prices of the securities.
+    :param prices: the assumed _unsafe_prices of the securities.
     :return: a mapping from contacts to allocated share counts.
     """
 
@@ -77,11 +78,13 @@ def find_closest_positions(
     except Exception as e:
         raise PortfolioSolverError(e)
 
-    assert "Infeasible" != (status := pulp.LpStatus[prob.status])
+    status = prob.status
+    if status == LpStatusInfeasible:
+        raise ProgrammingError(f"Solver returned infeasible: {prob}.")
 
     # this means the solver was interrupted -- we propagate that up
-    if "Not Solved" == status:
-        raise KeyboardInterrupt
+    elif status == "Not Solved":
+        raise KeyboardInterrupt()
 
     normed_misalloc = loss.value() / funds
     src.security.bounds.Policy.MISALLOCATION.validate(normed_misalloc)
@@ -90,7 +93,7 @@ def find_closest_positions(
 
 
 def calc_relative_misallocation(
-    ewlv: float,
+    equity: float,
     price: float,
     cur_alloc: int,
     target_alloc: int,
@@ -100,10 +103,9 @@ def calc_relative_misallocation(
 ) -> float:
 
     assert target_alloc >= 1
-    assert cur_alloc >= 1
 
     δ_frac = abs(1.0 - cur_alloc / target_alloc)
-    δ_pvf = price * abs(cur_alloc - target_alloc) / ewlv
+    δ_pvf = price * abs(cur_alloc - target_alloc) / equity
 
     return frac_coef * δ_frac + pvf_coef * δ_pvf
 

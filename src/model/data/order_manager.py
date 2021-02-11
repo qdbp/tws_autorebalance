@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from time import monotonic
-from typing import Optional, Union
+from typing import Iterator, Optional, Union
 
 from ibapi.order import Order
 
@@ -80,6 +80,9 @@ class OrderManager:
 
     def __init__(self) -> None:
         self._records: dict[int, Union[OMRecord, OMTombstone]] = {}
+
+    def __iter__(self) -> Iterator[tuple[int, Union[OMRecord, OMTombstone]]]:
+        yield from self._records.items()
 
     def reap(self, oid: int) -> None:
         if (

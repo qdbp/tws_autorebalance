@@ -79,7 +79,7 @@ class Position:
 
         qp, qt = abs(self.qty), abs(trade.qty)
 
-        # same sign: weighted average of prices
+        # same sign: weighted average of _unsafe_prices
         if sgn(self.qty) == sgn(trade.qty):
             new_av_price = (qp * self.av_price + qt * trade.price) / (qp + qt)
         # different sign, trade doesn't cancel position, price unchanged

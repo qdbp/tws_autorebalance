@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
 
-from src.model.calc_primitives import get_loan_at_target_utilization
+from src.model.calc_primitives import get_loan_at_target_usage
 
 
 def nct_leverage(nav: float, c0: float, c1: float) -> float:
@@ -56,7 +56,7 @@ def plot_loan_target_vs_nav(
         target_usage = min(0.95, ath_mu + dd * mu_coef)
 
         try:
-            loan_target = get_loan_at_target_utilization(
+            loan_target = get_loan_at_target_usage(
                 gpv - loan, margin_req, target_usage
             )
         except AssertionError:
@@ -88,10 +88,8 @@ def plot_loan_target_vs_nav(
 
     ax.set_xlabel("drawdown")
 
-    ax.plot(
-        dds, mus, label="margin utilization" if do_label else None, color="k"
-    )
-    ax.set_ylabel("margin utilization")
+    ax.plot(dds, mus, label="margin usage" if do_label else None, color="k")
+    ax.set_ylabel("margin usage")
 
     ax2.plot(dds, lts, label="loan target" if do_label else None)
     ax2.plot(
@@ -123,7 +121,7 @@ def plot_loan_target_vs_nav(
     ax2.plot(
         dds,
         ath_price * np.array(eqs) - np.array(lts),
-        label="ewlv at ATH" if do_label else None,
+        label="equity at ATH" if do_label else None,
         color="brown",
     )
     ax2.text(

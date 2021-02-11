@@ -1,114 +1,125 @@
 from __future__ import annotations
 
-import time
+from dataclasses import dataclass
+from typing import Optional
+
+from py9lib.errors import value_assert
 
 import src.security.bounds
-from src.model.calc_primitives import get_loan_at_target_utilization
 
 
+@dataclass(frozen=True)
 class MarginState:
     """
     A bookkeeping object responsible for managing the global financial state of
     the account.
+
+    Fields:
+        gpv: gross position value. Currently, has to be positive
+        cash: cash value, can be positive or negative.
+        min_maint_amt: minimum dollar maintenance amount
+        min_margin_req: min fractional margin requirement
+        cushion: calculated dollar maintenance values will be multiplied by this
+            value.
     """
 
+    gpv: float
+    cash: float
+    min_maint_amt: Optional[float] = None
+    min_margin_req: float = 0.25
+    cushion: float = 1.05
+
+    def __post_init__(self) -> None:
+        # set min margin req
+        value_assert(
+            0.0 < self.min_margin_req <= 1.0,
+            f"Invalid min margin req {self.min_margin_req:.4f}",
+        )
+        src.security.bounds.Policy.MARGIN_REQ.validate(self.min_margin_req)
+        if self.min_maint_amt is not None:
+            value_assert(self.min_maint_amt > 0, "Negative maintenance amount!")
+            value_assert(
+                self.nlv >= self.min_maint_amt,
+                "Trying to create underwater margin state: "
+                f"{self.nlv=:.2f} < {self.min_maint_amt:.2f}",
+            )
+        value_assert(self.cushion >= 1.0, "cushion < 1")
+        value_assert(self.gpv >= 0, "Only positive gpv is supported.")
+
     @classmethod
-    def of_acct_without_margin(cls, gpv: float) -> MarginState:
+    def of_acct_without_margin(cls, gpv: float, cash: float) -> MarginState:
         """
         Returns the MarginState giving correct behavior for accounts with no
         margin.
-
-        In this case it is assumed that gpv == ewlv.
         """
+        value_assert(
+            cash >= 0.0,
+            f"Tried to make marginless act with negative cash {cash=}",
+        )
         return MarginState(
-            gpv=gpv, ewlv=gpv, r0=1.0, min_margin_req=1.0, r0_safety_factor=1.0
+            gpv=gpv,
+            cash=cash,
+            min_maint_amt=gpv,
+            min_margin_req=1.0,
+            cushion=1.0,
         )
 
-    def __init__(
-        self,
-        gpv: float,
-        ewlv: float,
-        r0: float,
-        min_margin_req: float = 0.25,
-        r0_safety_factor: float = 1.1,
-    ):
-        """
-        :param gpv: Gross Position Value, as reported by TWS.
-        :param ewlv: Equity Value with Loan, as reported by TWS.
-        :param r0: Maintenance Margin Requirement, as reported by TWS, computed
-            according to TIMS requirement. This is used to calculate an
-            alternative minimum requirement for loan-margin_utilization
-            calculations, as margin_req >= r0_req_safety_factor * (r0 / gpv)
-        :param min_margin_req: a floor on the margin requirement used in
-            loan-margin_utilization computations.
-        :param r0_safety_factor: (r0 / gpv) is multiplied by this factor when
-            calculating the alternate minimum margin requirement. This safety
-            pad is intended to defend in depth against the market-dependent
-            fluctuations of r0.
-        """
-
-        # order matters here
-        self._gpv = gpv
-        self._ewlv = ewlv
-
-        self.r0 = r0
-
-        assert 0.0 < min_margin_req <= 1.0
-        self.min_margin_req = src.security.bounds.Policy.MARGIN_REQ.validate(
-            min_margin_req
-        )
-
-        assert r0_safety_factor >= 1.0
-        self.r0_safety_factor = r0_safety_factor
-
-        self.created = time.time()
-
     @property
-    def age(self) -> float:
-        return time.time() - self.created
-
-    @property
-    def gpv(self) -> float:
-        """
-        Gross position value.
-        """
-        return self._gpv
-
-    @gpv.setter
-    def gpv(self, gpv: float) -> None:
-        assert gpv >= 0
-        self._gpv = gpv
-
-    @property
-    def ewlv(self) -> float:
-        """
-        Equity with loan value.
-        """
-        return self._ewlv
-
-    @ewlv.setter
-    def ewlv(self, ewlv: float) -> None:
-        self._ewlv = ewlv
-
-    @property
-    def margin_req(self) -> float:
-        return max(
-            self.r0_safety_factor * self.r0 / self.gpv, self.min_margin_req
-        )
+    def nlv(self) -> float:
+        return self.gpv + self.cash
 
     @property
     def loan(self) -> float:
-        return self.gpv - self.ewlv
+        return -min(self.cash, -0.0)
 
     @property
-    def margin_utilization(self) -> float:
-        return self.loan / ((1 - self.margin_req) * self.gpv)
+    def equity(self) -> float:
+        return self.gpv + max(self.cash, 0.0)
 
-    def get_loan_at_utilization(self, target_utilization: float) -> float:
-        target_utilization = src.security.bounds.Policy.MARGIN_USAGE.validate(
-            target_utilization
+    @property
+    def margin_req(self) -> float:
+        d_term = (self.min_maint_amt or 0.0) / self.gpv
+        r_term = self.min_margin_req
+        return max(r_term, d_term) * self.cushion
+
+    @property
+    def maint_margin(self) -> float:
+        return self.margin_req * self.gpv
+
+    @property
+    def max_loan(self) -> float:
+        """
+        The loan at liquidation.
+
+        Eq(0) = NLV
+
+        NLV - MM = 0
+        NLV - r * Eq(L)
+        NLV + L - L - r * (NLV + L) = 0
+        NLV = r * (NLV + L)
+        L = NLV / r - NLV
+        L = NLV * (1 / r - 1)
+        """
+        return self.nlv * (1 / self.margin_req - 1)
+
+    @property
+    def margin_usage(self) -> float:
+        """
+        usage := loan / (loan at liquidation)
+        """
+        if self.loan == 0:
+            return 0.0
+        return self.loan / self.max_loan
+
+    def get_loan_at_usage(self, target_usage: float) -> float:
+        value_assert(
+            -1.0 <= target_usage <= 1.0,
+            f"invalid {target_usage=:.4f}",
         )
-        loan = get_loan_at_target_utilization(
-            self.ewlv, self.margin_req, target_utilization
-        )
-        return src.security.bounds.Policy.LOAN_AMT.validate(loan)
+        tu = src.security.bounds.Policy.MARGIN_USAGE.validate(target_usage)
+        if tu > 0:
+            return tu * self.max_loan
+        # we interpret negative usage as a cash percentage -- therefore,
+        # we will expect
+        else:
+            return tu * self.nlv

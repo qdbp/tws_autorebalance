@@ -1,7 +1,7 @@
 import operator
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Generic
+from typing import Any, Callable, Generic
 
 from src.security import LOG, N, SecError, T
 from src.util.format import color
@@ -93,7 +93,7 @@ class ThreeTierNMax(ThreeTierGeneric[N]):
 
     def fmt_val(self, val: N) -> str:
         if isinstance(val, float):
-            return f"{val:.3f}"
+            return f"{val:.3g}"
         else:
             return f"{val:0d}"
 
@@ -146,7 +146,7 @@ class Policy:
     )
     ORDER_QTY = ThreeTierNMax("ORDER SIZE", 250, 100, 50, "Large order size.")
     PER_ACCT_ORDER_TOTAL = ThreeTierNMax(
-        "ORDER TOTAL", 50000.0, 5000.0, 1000.0, "Large order amount."
+        "ORDER TOTAL", 15000.0, 5000.0, 1000.0, "Large order amount."
     )
     MISALLOC_DOLLARS = ThreeTierNMin(
         "MISALLOC $ MIN", 200, 400, 600, "Small dollar rebalance threshold."
@@ -170,3 +170,22 @@ class Policy:
 
     MAX_PRICING_AGE = 20  # seconds
     MAX_ACCT_SUM_AGE = 120  # seconds
+
+    @classmethod
+    def disable(cls, attr: str) -> Any:
+        # noinspection PyMethodParameters
+        class WithoutSecurity:
+            def __init__(self) -> None:
+                self.old = getattr(cls, attr)
+
+            def __enter__(self) -> None:
+                class Dummy:
+                    def validate(self, x: T, *_: Any, **__: Any) -> T:
+                        return x
+
+                setattr(cls, attr, Dummy())
+
+            def __exit__(self, exc_type, exc_val, exc_tb):  # type: ignore
+                setattr(cls, attr, self.old)
+
+        return WithoutSecurity()
