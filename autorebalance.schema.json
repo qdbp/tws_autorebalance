@@ -109,6 +109,8 @@
           "description": "Where TWS saves intraday logs."
         }
       }
+    },
+    "flex_query": {"$ref": "#/definitions/flex_query"
     }
   },
   "definitions": {
