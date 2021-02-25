@@ -78,6 +78,12 @@ class MarginState:
 
     @property
     def margin_req(self) -> float:
+        """
+        Returns:
+            the cushioned minimum margin requirement.
+            determined from the highest of the minimum requirement and the
+            minimum amount.
+        """
         d_term = (self.min_maint_amt or 0.0) / self.gpv
         r_term = self.min_margin_req
         return max(r_term, d_term) * self.cushion
@@ -103,13 +109,24 @@ class MarginState:
         return self.nlv * (1 / self.margin_req - 1)
 
     @property
-    def margin_usage(self) -> float:
+    def margin_usage_u(self) -> float:
         """
+        "u" from the investigation.
         usage := loan / (loan at liquidation)
+               =
         """
         if self.loan == 0:
             return 0.0
         return self.loan / self.max_loan
+
+    @property
+    def margin_usage_v(self) -> float:
+        """
+        "v" from the investigation.
+
+        v := mmr / nlv
+        """
+        return self.margin_req / self.nlv
 
     def get_loan_at_usage(self, target_usage: float) -> float:
         value_assert(
