@@ -16,6 +16,15 @@ class SecBoundsError(SecError):
 
 @dataclass(frozen=True)  # type: ignore
 class ThreeTierGeneric(Generic[T]):
+    """
+    A security validator of a scalar value.
+
+    Compares the value to three thresholds:
+
+        a block threshold, which rejects the value when exceeded
+        a confirm threshold, which asks for a manual confirmation when exceeded
+        a notify threshold, which logs when the value is exceeded
+    """
 
     name: str
     block_level: T
@@ -146,7 +155,7 @@ class Policy:
     )
     ORDER_QTY = ThreeTierNMax("ORDER SIZE", 250, 100, 50, "Large order size.")
     PER_ACCT_ORDER_TOTAL = ThreeTierNMax(
-        "ORDER TOTAL", 15000.0, 5000.0, 1000.0, "Large order amount."
+        "ORDER TOTAL", 3e4, 1e4, 2.5e3, "Large order amount."
     )
     MISALLOC_DOLLARS = ThreeTierNMin(
         "MISALLOC $ MIN", 200, 400, 600, "Small dollar rebalance threshold."
@@ -162,10 +171,18 @@ class Policy:
         "ATH MARGIN USER", 0.3, 0.2, 0.0, "High ATH margin usage."
     )
     DRAWDOWN_COEFFICIENT = ThreeTierNMax(
-        "DRAWDOWN COEFFICIENT", 2.0, 1.5, 0.5, "High drawdown coefficient."
+        "DRAWDOWN COEFFICIENT", 1.0, 0.5, 0.25, "High drawdown coefficient."
     )
 
-    # number of seconds to wait before the same contract can be traded again
+    RATCHET_MAX_STEP = ThreeTierNMax(
+        "COMPOSITION RATCHET STEP",
+        0.75,
+        0.25,
+        0.0,
+        "Composition adjustment ratcheted too far in one step.",
+    )
+
+    # number of seconds to wait before the same symbol can be traded again
     ORDER_COOLOFF = 55
 
     MAX_PRICING_AGE = 20  # seconds

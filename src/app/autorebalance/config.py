@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from src import config
 from src.model import Acct
-from src.model.data import Composition
+from src.model.composition import Composition
 from src.security.bounds import Policy
 
 
@@ -113,6 +113,7 @@ class AutoRebalanceMarginConfig:
     dd_coef: float
     min_margin_req: float
     update_ath: bool
+    cushion: float
 
     def __post_init__(self) -> None:
         f: Field[Any]

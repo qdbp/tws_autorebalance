@@ -2,9 +2,9 @@ import numpy as np
 from _pytest.python_api import raises
 from ibapi.contract import Contract
 
-from src.model.calc import find_closest_positions
-from src.model.calc_primitives import shrink
-from src.model.data import Composition, SimpleContract
+from src.model.composition import Composition, find_closest_positions
+from src.model.contract import SimpleContract
+from src.util.calc import shrink
 
 
 def test_allocator() -> None:

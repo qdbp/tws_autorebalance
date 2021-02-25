@@ -21,26 +21,23 @@ from py9lib.errors import value_assert
 from src import PROJECT_ROOT, ConfigWriteback
 from src.app.autorebalance.config import AutoRebalanceConfig
 from src.app.base import TWSApp, WorkerStatus
-from src.model import Acct
-from src.model.calc import (
+from src.model import TZ_EASTERN, Acct
+from src.model.bar import OHLCBar
+from src.model.composition import (
     PortfolioSolverError,
     calc_relative_misallocation,
     find_closest_positions,
 )
-from src.model.calc_primitives import secs_until_market_open, sgn
-from src.model.constants import TZ_EASTERN
-from src.model.data import OHLCBar, SimpleContract, SimpleOrder
-from src.model.data.margin import MarginState
-from src.model.data.order_manager import (
-    OMRecord,
-    OMState,
-    OMTombstone,
-    OrderManager,
-)
+from src.model.contract import SimpleContract
+from src.model.margin import MarginState
+from src.model.order import SimpleOrder
+from src.model.order_manager import OMRecord, OMState, OMTombstone, OrderManager
 from src.security import PERMIT_ERROR
 from src.security.bounds import Policy
 from src.security.liveness import LivenessError
+from src.util.calc import sgn
 from src.util.format import color, pp_order
+from src.util.markets import secs_until_market_open
 
 REBALANCE_STATUS_FILE = (PROJECT_ROOT / "rebalance_status.txt").absolute()
 
@@ -49,7 +46,7 @@ REBALANCE_STATUS_FILE = (PROJECT_ROOT / "rebalance_status.txt").absolute()
 class AcctState:
 
     # state variables
-    # TODO this doesn't really belong here, not sure how to shuffle it out...
+    # TODO this doesn't really belong here, not sure how to shuffle it master_eq...
     seen_ath: Optional[float] = None
 
     margin: Optional[MarginState] = None
@@ -81,12 +78,15 @@ class AutoRebalanceApp(TWSApp):
     ACCT_SUM_REQ_ID = 10000
     PORTFOLIO_PRICE_REQ_ID = 30000
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, disarm: bool = False, **kwargs: Any) -> None:
 
         TWSApp.__init__(self, self.APP_ID, **kwargs)
 
         # user config config
         self.conf: AutoRebalanceConfig = AutoRebalanceConfig.load()
+        if disarm:
+            self.conf = replace(self.conf, armed=False)
+
         self.log.debug(
             f"Running with the following config:\n{self.conf.dump_config()}"
         )
@@ -105,6 +105,7 @@ class AutoRebalanceApp(TWSApp):
 
         # i/o
         self.status_file = open(REBALANCE_STATUS_FILE, "w")
+        self._issued_warnings: set[str] = set()
 
     # PROPERTIES
     @property
@@ -116,7 +117,8 @@ class AutoRebalanceApp(TWSApp):
     ) -> dict[SimpleContract, float]:
         """
         Returns the current fractional allocation to each of the account's
-        composition targets.
+        composition targets. Normalizes overallocated positions to be 100%
+        allocated, but does not normalize underalloced positions.
 
         Args:
             acct: the account for which to get the positions
@@ -181,11 +183,15 @@ class AutoRebalanceApp(TWSApp):
     def accountSummary(
         self, req_id: int, acct: Acct, tag: str, value: str, currency: str
     ) -> None:
+
         if acct not in self.accts:
-            self.log.warning(
+            msg = (
                 f"Got info for account {acct} I don't know about."
                 f"Ignoring it."
             )
+            if msg not in self._issued_warnings:
+                self.log.warning(msg)
+                self._issued_warnings.add(msg)
             return
 
         if acct not in self.acct_st:
@@ -228,11 +234,12 @@ class AutoRebalanceApp(TWSApp):
                     cash=cash,
                     min_maint_amt=min_maint_amt,
                     min_margin_req=acct_conf.margin.min_margin_req,
+                    cushion=acct_conf.margin.cushion,
                 )
 
             self.log.debug(
                 f"Got acct. info: "
-                f"margin util. = {st.margin.margin_usage:%}, "
+                f"margin util. = {st.margin.margin_usage_u:%}, "
                 f"margin req. = {st.margin.margin_req:%}, "
                 f"GPV={st.margin.gpv / 1000:.1f}k, "
                 f"LOAN={st.margin.loan / 1000:.1f}k."
@@ -418,7 +425,7 @@ class AutoRebalanceApp(TWSApp):
         *_: Any,
     ) -> None:
         if (contract := self.price_watchers.get(req_id)) is not None:
-            # self.log.debug(f"Received price for {contract.symbol}: {c:.2f}")
+            # self.log.debug(f"Received price for {symbol.symbol}: {c:.2f}")
             self._unsafe_prices[contract] = OHLCBar(t, o, h, l, c)
         else:
             self.kill(f"Received unsolicited price {req_id=}")
@@ -516,11 +523,72 @@ class AutoRebalanceApp(TWSApp):
     def increment_acct_composition_to_goal(
         self, acct: Acct, equity: float
     ) -> None:
+        """
+        Adjusts the current account composition toward the configured target.
+
+        Note: there are two ways of doing this -- a more aggressive and a
+        more conservative.  The aggressive approach ratchets on margin-ramp
+        overallocation, whereas the conservative approach only ratchets
+        on relative composition price movements.
+
+        This function takes the conservative approach -- this is encoded in
+        the definition of empirical_allocation, which normalizes overallocated
+        position to be 100% allocated. The aggressive approach is actually
+        foundationally unsuitable to gradual ramps, as explained below.
+
+        Illustration:
+
+            Take our securities to be A, B.
+            Denote empirical allocations by [], compositions by (), and
+            semi-compositions (summing to at most 1) by <> -- these are used
+            by the ratcheting algorithm.
+
+            I have a (50, 50) composition, but my target is (80, 30)
+
+            The prices of the securities fall such that at the current
+            composition, the empirical target becomes [65, 60], where we are at
+            a margin target of 25%.
+
+            The conservative approach ratchets based on the _relative_, (i.e.
+            excluding margin ramp) misallocation, and thus the ratchet receives
+            <52 = 65 / 125, 48> as the empirical, and returns the composition
+            (52, 48). Our target empirical doesn't change.
+
+            The aggressive approach ratchets based on the absolute (i.e.
+            including margin ramp) misallocation. In this case the ratchet gets
+            the denormalized empirical allocation <40, 40>, which ratchets to
+            an allocation of (60, 40). This gets ramped to [75, 50] empirical
+            rebalance target.
+
+            The careful reader should have noticed that the margin ramp
+            depends on the relative allocation through the ATH. The calculations
+            above should in principle be iterated. In this case the conservative
+            approach would converge to the target immediately, defeating the
+            purpose of a target allocation. For the conservative approach, no
+            a-prior iteration is implemented -- it happens smoothly enough for
+            live ATH+allocation feedback to not need "debouncing" through
+            preemptive iteration.
+
+        Args:
+            acct: the account for which to update toward the target
+            equity: the nlv of the account to use in normalizing the
+                ratchet empirical.
+
+        Returns:
+        """
         cur_alloc = self.empirical_allocation(acct, equity)
         acct_cfg = self.conf.accounts[acct]
 
-        new_comp = acct_cfg.composition.update_toward_target(
-            acct_cfg.goal_composition, seen_alloc=cur_alloc
+        new_comp = acct_cfg.composition.ratchet_toward(
+            acct_cfg.goal_composition, empirical_alloc=cur_alloc
+        )
+        Policy.RATCHET_MAX_STEP.validate(
+            max(
+                [
+                    abs(acct_cfg.composition[sc] - new_comp[sc])
+                    for sc in acct_cfg.composition.contracts
+                ]
+            )
         )
 
         if new_comp == acct_cfg.composition:
@@ -617,7 +685,9 @@ class AutoRebalanceApp(TWSApp):
             status_str = f"[{acct}] "
 
             if acct_cfg.margin is not None:
-                status_str += f"current mu: {acct_st.margin.margin_usage:.2%}, "
+                status_str += (
+                    f"current mu: {acct_st.margin.margin_usage_u:.2%}, "
+                )
                 status_str += f"target mu: {target_mu:.2%} "
 
             pos_line = ", ".join(
@@ -663,7 +733,7 @@ class AutoRebalanceApp(TWSApp):
         deadlock.
 
         Args:
-            sc: contract of the order
+            sc: symbol of the order
             order: Order object with order details, per TWS API
         """
 
@@ -766,10 +836,12 @@ class AutoRebalanceApp(TWSApp):
         )
 
 
-def arb_entrypoint(debug: bool = False) -> None:
+def arb_entrypoint(debug: bool = False, disarm: bool = False) -> None:
     while True:
         s = secs_until_market_open()
-        app = AutoRebalanceApp(log_level=INFO if not debug else DEBUG)
+        app = AutoRebalanceApp(
+            log_level=INFO if not debug else DEBUG, disarm=disarm
+        )
         if s > 5:
             app.log.info(f"Sleeping for {int(s)} seconds until markets open.")
             sleep(s - 5)

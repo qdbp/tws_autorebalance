@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.model.data.margin import MarginState
+from src.model.margin import MarginState
 from src.security.bounds import Policy
 
 
@@ -30,6 +30,15 @@ def test_margin_state_invariants():
         MarginState(1000, 0).get_loan_at_usage(-2)
     with pytest.raises(ValueError):
         MarginState(1000, 0).get_loan_at_usage(2)
+
+
+def test_margin_state_alt_minimums() -> None:
+
+    m = MarginState(1000, 0, 500, 0.25, cushion=1.1)
+    assert m.margin_req == 0.55
+
+    m = MarginState(1000, 0, 100, 0.50, cushion=1.0)
+    assert m.margin_req == 0.50
 
 
 def test_margin_state_properties_cash() -> None:
@@ -136,7 +145,7 @@ def test_in_debt():
     my_margin_util = my_loan / 3200
 
     assert np.isclose(m.max_loan, my_max_loan)
-    assert m.margin_usage == my_margin_util
+    assert m.margin_usage_u == my_margin_util
 
 
 def test_marginless() -> None:
@@ -148,7 +157,7 @@ def test_marginless() -> None:
     assert m.max_loan == 0 == m.max_loan
     assert m.maint_margin == my_gpv == m.gpv
 
-    assert m.margin_usage == 0
+    assert m.margin_usage_u == 0
     with Policy.disable("MARGIN_USAGE"):
         for util in [0.0, 0.2, 0.8, 1.0]:
             assert m.get_loan_at_usage(util) == 0

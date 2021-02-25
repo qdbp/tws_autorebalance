@@ -19,11 +19,15 @@ from matplotlib.ticker import MultipleLocator
 from tqdm import tqdm
 
 from src import config, data_fn
-from src.model import Acct
-from src.model.calc import PAttrMode, calculate_profit_attributions
-from src.model.constants import ONE_DAY, TZ_EASTERN
-from src.model.data import Composition
-from src.model.data.trades import AttributionSet, Portfolio, Trade
+from src.analysis.model import (
+    AttributionSet,
+    PAttrMode,
+    Portfolio,
+    Trade,
+    calculate_profit_attributions,
+)
+from src.model import ONE_DAY, TZ_EASTERN, Acct
+from src.model.composition import Composition
 
 matplotlib.rc("figure", figsize=(12, 8))
 
@@ -147,13 +151,13 @@ def get_args() -> Namespace:
         "--start",
         default="1900-01-01",
         type=datetime.fromisoformat,
-        help="start date for trade attribution analysis",
+        help="start dt for trade attribution analysis",
     )
     parser.add_argument(
         "--end",
         default="2100-01-01",
         type=datetime.fromisoformat,
-        help="end date for trade attribution analysis",
+        help="end dt for trade attribution analysis",
     )
 
     args = parser.parse_args()

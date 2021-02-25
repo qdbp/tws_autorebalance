@@ -11,8 +11,9 @@ from pandas import DataFrame, DatetimeIndex, read_sql, to_datetime
 
 from src import data_fn
 from src.app.base import TWSApp
-from src.model.constants import ONE_DAY, TZ_EASTERN
-from src.model.data import OHLCBar, SimpleContract
+from src.model import ONE_DAY, TZ_EASTERN
+from src.model.bar import OHLCBar
+from src.model.contract import SimpleContract
 from src.util.format import color
 
 TickType = Literal["mid", "bid", "ask", "trades"]
@@ -40,7 +41,7 @@ VALID_INTERVALS = MappingProxyType(
     }
 )
 
-# maximum length of span (value) allowed for interval (key) when loading data
+# maximum length of span (value) allowed for interval (query) when loading data
 # only includes values allowing less than a full day.
 MAX_SPANS = MappingProxyType(
     {

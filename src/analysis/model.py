@@ -1,17 +1,29 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
-from typing import Callable, ItemsView, Iterable, KeysView, ValuesView
+from functools import lru_cache
+from itertools import product
+from typing import (
+    Callable,
+    ItemsView,
+    Iterable,
+    KeysView,
+    Literal,
+    Optional,
+    ValuesView,
+)
 
 import numpy as np
 from dateutil.rrule import MO
 from matplotlib.axes import Axes
 from matplotlib.dates import DateFormatter, DayLocator, WeekdayLocator, date2num
 from pandas import date_range
+from pulp import COIN, LpInteger, LpProblem, LpStatus
+from pulp_lparray import lparray
 
-from src.model.calc_primitives import sgn
-from src.model.constants import ONE_DAY, TZ_EASTERN
+from src.model import ONE_DAY, TZ_EASTERN
+from src.util.calc import sgn, shrink
 from src.util.format import assert_type, fmt_dollars
 
 
@@ -37,15 +49,15 @@ class Trade:
 
 
 @dataclass(frozen=True, order=True)
-class Position:
+class AvPricePosition:
     """
-    Represents a position in a contract.
+    Represents a net position in a symbol, using average price accounting.
 
-    The contract is identified by its symbol, and can have either a positive or
+    The symbol is identified by its symbol, and can have either a positive or
     negative number of open units at a given average price.
 
-    In addition to the contract position, a loan credit field is associated to
-    the Position as an accounting convenience when netting trades against the
+    In addition to the symbol position, a loan credit field is associated to
+    the AvPricePosition as an accounting convenience when netting trades against the
     position. The debit field allows, for instance, to calculate the net
     realized loan of a sequence of trades.
     """
@@ -61,11 +73,11 @@ class Position:
         assert self.av_price >= 0
 
     @classmethod
-    def empty(cls, sym: str) -> Position:
-        return Position(sym, 0.0, 0, 0.0)
+    def empty(cls, sym: str) -> AvPricePosition:
+        return AvPricePosition(sym, 0.0, 0, 0.0)
 
     @classmethod
-    def from_trades(cls, trades: list[Trade]) -> Position:
+    def from_trades(cls, trades: list[Trade]) -> AvPricePosition:
         assert trades
         # noinspection PyTypeChecker
         trades = sorted(trades)
@@ -74,7 +86,7 @@ class Position:
             p = p.transact(t)
         return p
 
-    def transact(self, trade: Trade) -> Position:
+    def transact(self, trade: Trade) -> AvPricePosition:
         assert trade.sym == self.sym
 
         qp, qt = abs(self.qty), abs(trade.qty)
@@ -93,7 +105,7 @@ class Position:
         else:
             new_av_price = trade.price
 
-        return Position(
+        return AvPricePosition(
             sym=self.sym,
             av_price=new_av_price,
             qty=trade.qty + self.qty,
@@ -113,7 +125,7 @@ class Position:
 
     def __str__(self) -> str:
         return (
-            f"Position[{self.qty: >5d} {self.sym:<4s} at "
+            f"AvPricePosition[{self.qty: >5d} {self.sym:<4s} at "
             f"{self.av_price: >6.2f} and {fmt_dollars(self.credit)} loan"
             f" -> {fmt_dollars(self.book_nlv)} book]"
         )
@@ -125,22 +137,22 @@ class Portfolio:
     """
 
     def __init__(self) -> None:
-        self._positions: dict[str, Position] = {}
+        self._positions: dict[str, AvPricePosition] = {}
 
     @classmethod
     def from_trade_dict(cls, trade_dict: dict[str, list[Trade]]) -> Portfolio:
         port = cls()
         for sym, trades in trade_dict.items():
-            port[sym] = Position.from_trades(trades)
+            port[sym] = AvPricePosition.from_trades(trades)
         return port
 
     def transact(self, trade: Trade) -> None:
         assert_type(trade, Trade)
         self[trade.sym] = self._positions.get(
-            trade.sym, Position.empty(trade.sym)
+            trade.sym, AvPricePosition.empty(trade.sym)
         ).transact(trade)
 
-    def filter(self, func: Callable[[Position], bool]) -> Portfolio:
+    def filter(self, func: Callable[[AvPricePosition], bool]) -> Portfolio:
         out = Portfolio()
         for sym, pos in self.items:
             if func(pos):
@@ -159,19 +171,19 @@ class Portfolio:
     def basis(self) -> float:
         return sum(pos.basis for pos in self._positions.values())
 
-    def __getitem__(self, sym: str) -> Position:
+    def __getitem__(self, sym: str) -> AvPricePosition:
         return self._positions[sym]
 
-    def __setitem__(self, sym: str, position: Position) -> None:
+    def __setitem__(self, sym: str, position: AvPricePosition) -> None:
         assert position.sym == sym
         self._positions[sym] = position
 
     @property
-    def items(self) -> ItemsView[str, Position]:
+    def items(self) -> ItemsView[str, AvPricePosition]:
         return self._positions.items()
 
     @property
-    def positions(self) -> ValuesView[Position]:
+    def positions(self) -> ValuesView[AvPricePosition]:
         return self._positions.values()
 
     @property
@@ -333,7 +345,7 @@ class AttributionSet:
 
     @property
     def pas_by_profit(self) -> list[ProfitAttribution]:
-        return sorted(self.pas, key=lambda pa: pa.net_gain)
+        return sorted(self.pas, key=lambda pa: pa._net_gain)
 
     def plot_arrows(
         self,
@@ -409,7 +421,7 @@ class AttributionSet:
         uby = max([max(pa.buy_price, pa.sell_price) for pa in pas]) + 1
         ax.set_ylim(lby, uby)
 
-        ax.set_xlabel("Trade date")
+        ax.set_xlabel("Trade dt")
         ax.set_ylabel("Trade price")
 
         for day in date_range(
@@ -443,3 +455,152 @@ class AttributionSet:
         ax.xaxis.set_minor_formatter(DateFormatter("%d"))
         ax.grid(color="#808080", lw=0.5)
         ax.grid(color="#808080", lw=0.25, axis="x", which="minor")
+
+
+PAttrMode = Literal[
+    "max_loss", "max_gain", "min_variation", "longest", "shortest"
+]
+
+
+@lru_cache()
+def calculate_profit_attributions(
+    trades: tuple[Trade],
+    mode: PAttrMode = "min_variation",
+    min_var_gamma: float = 1.05,
+) -> tuple[list[ProfitAttribution], Optional[AvPricePosition]]:
+
+    """
+    Convert a list of trades into ProfitAttributions, matching opposite-side
+    trades in a LIFO fashion. Returns this list and the net unmatched position.
+
+    Uses a MILP solver to assign opening trades to closing trades according to a
+    preferred criterion, given as `mode`. The modes are:
+
+    Modes:
+        max_loss: attempt to maximize losses by matching lowest sells with
+            highest buys. Note that this can be acausal, e.g. a sale can be
+            matched with a later buy even when you are long the instrument at
+            the time it is made.
+        max_gain: the opposite of max_loss, same caveat.
+        min_variation: attempt to minimize total variation in realized gains.
+        longest: maximizes the total time between opening and closing trades.
+        shortest: minimizes the total time between opening and closing trades.
+
+    Args:
+        trades: the list of trades to parse into attributions
+        mode: the mode, as described above.
+        min_var_gamma: if the mode is min_variation, the price gap is actually
+            raised to this power (which should be just above 1) in the price
+            matrix to force the optimizer to minimize the average individual
+            gaps as a quasi-subproblem.
+
+    Returns:
+        a tuple of:
+            the list of ProfitAttributions generated according to the mode,
+            the residual AvPricePosition composed of unmatched trades.
+    """
+
+    if len(trades) == 0:
+        return [], None
+
+    buys = sorted([t for t in trades if t.qty > 0], key=lambda x: x.price)
+    sells = sorted([t for t in trades if t.qty < 0], key=lambda x: x.price)
+
+    nb = len(buys)
+    ns = len(sells)
+
+    if min(nb, ns) == 0:
+        return [], AvPricePosition.from_trades(list(trades))
+
+    loss = np.zeros((nb, ns))
+
+    # for many of these modes there are probably bespoke algorithms with more
+    # finesse...
+    # ... but the sledgehammer is more fun than the scalpel.
+    for bx, sx in product(range(nb), range(ns)):
+        buy = buys[bx]
+        sell = sells[sx]
+        if mode == "max_loss":
+            loss[bx, sx] = sell.price - buy.price
+        elif mode == "max_gain":
+            loss[bx, sx] = buy.price - sell.price
+        elif mode == "min_variation":
+            loss[bx, sx] = abs(buy.price - sell.price) ** min_var_gamma
+        elif mode == "longest":
+            start = min(buy.time, sell.time)
+            end = max(buy.time, sell.time)
+            loss[bx, sx] = (start - end).total_seconds() / 86400
+        elif mode == "shortest":
+            start = min(buy.time, sell.time)
+            end = max(buy.time, sell.time)
+            loss[bx, sx] = (end - start).total_seconds() / 86400
+        else:
+            raise ValueError()
+
+    # we ensure that we always decrease our loss by making any assignment to
+    # guarantee that all min(nb, ns) possible shares are matched.
+    # noinspection PyArgumentList
+    loss -= loss.max() + 1.0
+
+    sell_qty_limit = np.array([-t.qty for t in sells], dtype=np.uint32)
+    buy_qty_limit = np.array([t.qty for t in buys], dtype=np.uint32)
+
+    prob = LpProblem()
+
+    match: lparray = lparray.create_anon(
+        "Match", (nb, ns), cat=LpInteger, lowBound=0
+    )
+
+    (match.sum(axis=0) <= sell_qty_limit).constrain(prob, "SellLimit")
+    (match.sum(axis=1) <= buy_qty_limit).constrain(prob, "BuyLimit")
+
+    cost = (match * loss).sumit()
+    prob += cost
+
+    COIN(msg=False, threads=24).solve(prob)
+    solution = match.values
+
+    assert LpStatus[prob.status] == "Optimal"
+    # double-check that no possible trades have been withheld
+    assert solution.sum() == min(sell_qty_limit.sum(), buy_qty_limit.sum())
+
+    pas = []
+    for bx, sx in zip(*np.nonzero(solution)):
+        buy = buys[bx]
+        sell = sells[sx]
+        assert buy.sym == sell.sym
+
+        attributed_qty = int(solution[bx, sx])
+
+        new_buy: Trade = replace(buy, qty=attributed_qty)
+        new_sell: Trade = replace(sell, qty=-attributed_qty)
+
+        pas.append(
+            ProfitAttribution(
+                open_trade=new_buy
+                if new_buy.time < new_sell.time
+                else new_sell,
+                close_trade=new_buy
+                if new_buy.time > new_sell.time
+                else new_sell,
+            )
+        )
+
+    residual_trades = []
+    if nb < ns:
+        for sx in range(ns):
+            unmatched = int(shrink(sells[sx].qty, solution[:, sx].sum()))
+            if unmatched < 0:
+                residual_trades.append(replace(sells[sx], qty=unmatched))
+    elif ns < nb:
+        for bx in range(nb):
+            unmatched = int(shrink(buys[bx].qty, solution[bx, :].sum()))
+            if unmatched > 0:
+                residual_trades.append(replace(buys[bx], qty=unmatched))
+
+    if residual_trades:
+        pos = AvPricePosition.from_trades(residual_trades)
+    else:
+        pos = AvPricePosition.empty(trades[0].sym)
+
+    return pas, pos

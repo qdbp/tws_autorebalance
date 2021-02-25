@@ -33,35 +33,7 @@
                   }
                 },
                 "margin": {
-                  "additionalProperties": false,
-                  "type": "object",
-                  "required": [
-                    "dd_reference_ath",
-                    "mu_at_ath",
-                    "dd_coef",
-                    "min_margin_req",
-                    "update_ath"
-                  ],
-                  "properties": {
-                    "dd_reference_ath": {
-                      "type": "number",
-                      "minimum": 0.01
-                    },
-                    "mu_at_ath": {
-                      "type": "number",
-                      "minimum": -1.0
-                    },
-                    "dd_coef": {
-                      "type": "number"
-                    },
-                    "min_margin_req": {
-                      "type": "number",
-                      "minimum": 0.0,
-                      "maximum": 1.0
-                    },
-                    "update_ath": {
-                    }
-                  }
+                  "$ref": "#/definitions/margin"
                 },
                 "rebalance": {
                   "additionalProperties": false,
@@ -83,8 +55,7 @@
                 }
               }
             }
-          },
-          "description": "The person's first name."
+          }
         }
       }
     },
@@ -171,6 +142,60 @@
           "description": "Goal target composition, percent. The bot will try to passively drift toward this value, changing cur_pct along the way."
         }
       }
+    },
+    "margin": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "dd_reference_ath",
+        "mu_at_ath",
+        "dd_coef",
+        "min_margin_req",
+        "update_ath"
+      ],
+      "properties": {
+        "dd_reference_ath": {
+          "type": "number",
+          "minimum": 0.01
+        },
+        "mu_at_ath": {
+          "type": "number",
+          "minimum": -1.0
+        },
+        "dd_coef": {
+          "type": "number"
+        },
+        "min_margin_req": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "update_ath": {
+          "type": "boolean"
+        },
+        "cushion": {
+          "type": "number",
+          "minimum": 1.00
+        }
+      }
+    },
+    "flex_query": {
+      "description": "Specifies the token and Query IDs for a CSV flex query endpoints",
+      "properties": {
+        "token": {
+          "type": "number",
+          "description": "Access token for queries for this account."
+        },
+        "trades": {
+          "type": "number",
+          "description": "Query ID for trade information."
+        },
+        "lots": {
+          "type": "number",
+          "description": "Query ID for tax lot information."
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

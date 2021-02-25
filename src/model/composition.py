@@ -1,133 +1,18 @@
 from __future__ import annotations
 
-# noinspection PyUnresolvedReferences
 from dataclasses import dataclass
-from datetime import datetime
-from functools import cached_property
-
-# TODO but we have https://bugs.python.org/issue43141 limiting some uses
 from typing import Any, Collection, Mapping, Union
 
 import numpy as np
-from ibapi.contract import Contract
-from ibapi.order import Order
-from py9lib.errors import runtime_assert, value_assert
+import pulp
+from pulp import LpStatusInfeasible
+from pulp_lparray import lparray
+from py9lib.errors import ProgrammingError, precondition
 
 from src import LOG
-from src.model import Acct
-from src.model.constants import TWS_GTD_FORMAT
+from src.model import ATOL_EPS, RTOL_EPS
+from src.model.contract import SimpleContract
 from src.security.bounds import Policy
-
-
-@dataclass(frozen=True, order=True)
-class OHLCBar:
-    __slots__ = ("t", "o", "h", "l", "c")
-    t: int
-    o: float
-    h: float
-    l: float
-    c: float
-
-    def __str__(self) -> str:
-        return (
-            f"OHLCBar({datetime.fromtimestamp(self.t)}: "
-            f"{self.o:.2f}/{self.h:.2f}/{self.l:.2f}/{self.c:.2f}"
-        )
-
-
-@dataclass(frozen=True, order=True)
-class SimpleContract:
-    symbol: str
-    pex: str
-
-    def __post_init__(self) -> None:
-        assert self.pex and self.pex != "SMART"
-        assert self.symbol
-
-    @classmethod
-    def normalize_contract(cls, contract: Contract) -> Contract:
-        assert contract.primaryExchange != "SMART"
-        assert contract.secType == "STK"
-        assert contract.currency == "USD"
-
-        if contract.primaryExchange:
-            pex = contract.primaryExchange
-        else:
-            assert contract.exchange != "SMART"
-            pex = contract.exchange
-
-        return cls(symbol=contract.symbol, pex=pex).contract
-
-    @classmethod
-    def from_contract(cls, contract: Contract) -> SimpleContract:
-        contract = cls.normalize_contract(contract)
-        return cls(symbol=contract.symbol, pex=contract.primaryExchange)
-
-    @cached_property
-    def contract(self) -> Contract:
-        out = Contract()
-        out.symbol = self.symbol
-        out.secType = "STK"
-        out.currency = "USD"
-        out.exchange = "SMART"
-        if self.pex == "NASDAQ":
-            out.primaryExchange = "ISLAND"
-        else:
-            out.primaryExchange = self.pex
-        return out
-
-    def __str__(self) -> str:
-        return f"SimpleContract({self.symbol}/{self.pex})"
-
-    def __hash__(self) -> int:
-        return hash((self.symbol, self.pex))
-
-    __repr__ = __str__
-
-
-@dataclass(frozen=True)
-class SimpleOrder:
-    """
-    Convenience wrapper around the base TWS API wrapper.
-
-    Makes some fields mandatory and hides boilerplate.
-    """
-
-    acct: Acct
-    num_shares: int
-    limit_price: float
-    gtd: datetime
-    transmit: bool
-    raw_order: Order = None
-
-    def __post_init__(self) -> None:
-        runtime_assert(self.num_shares != 0)
-
-    @cached_property
-    def to_order(self) -> Order:
-        order = Order()
-        order.account = self.acct
-        order.orderType = "MIDPRICE"
-        qty = abs(self.num_shares)
-        order.totalQuantity = Policy.ORDER_QTY.validate(qty)
-        order.action = "BUY" if self.num_shares > 0 else "SELL"
-        order.lmtPrice = self.limit_price
-        order.tif = "GTD"
-        order.goodTillDate = self.gtd.strftime(TWS_GTD_FORMAT)
-        order.transmit = self.transmit
-        return order
-
-    @classmethod
-    def from_order(cls, order: Order) -> SimpleOrder:
-        return cls(
-            acct=order.account,
-            num_shares=order.totalQuantity
-            * (-1 if order.action == "SELL" else 1),
-            limit_price=order.lmtPrice,
-            gtd=datetime.strptime(order.goodTillDate, TWS_GTD_FORMAT),
-            raw_order=order,
-            transmit=order.transmit,
-        )
 
 
 @dataclass(frozen=True)
@@ -140,7 +25,9 @@ class Composition:
     _composition: dict[SimpleContract, float]
 
     def __post_init__(self) -> None:
-        assert np.isclose(sum(self._composition.values()), 1.0)
+        assert np.isclose(
+            sum(self._composition.values()), 1.0, atol=ATOL_EPS, rtol=RTOL_EPS
+        )
         assert all(
             isinstance(k, SimpleContract) and isinstance(v, float)
             for k, v in self.items
@@ -234,6 +121,9 @@ class Composition:
     def __len__(self) -> int:
         return len(self._composition)
 
+    def as_dict(self) -> dict[SimpleContract, float]:
+        return {**self._composition}
+
     @property
     def contracts(self) -> Collection[SimpleContract]:
         # noinspection PyTypeChecker
@@ -250,16 +140,18 @@ class Composition:
             f'"{contract.symbol}" * {pct:.2f}' for contract, pct in self.items
         )
 
-    def update_toward_target(
+    def ratchet_toward(
         self,
         target: Composition,
-        seen_alloc: Mapping[SimpleContract, float],
+        empirical_alloc: Mapping[SimpleContract, float],
     ) -> Composition:
         """
-        Assuming actual allocations of certain contracts have gone down to
+        Click click.
+
+        Assuming the empirical allocation of certain contracts has gone down to
         fractions indicated in `changes`, "locks in" those changes to the
         extent they move the current composition closer to the given target.
-        The net allocation change among changees that have lost composition is
+        The net allocation change among changes that have lost composition is
         pro-rated among those who have gained on a pro-rated basis.
 
         Example:
@@ -276,18 +168,30 @@ class Composition:
 
         The result is that the loss of A is locked in and prorated to the other
         changed targets in proportion to their shortfall.
+
+        Args:
+            target: the target Composition to ratchet toward
+            empirical_alloc: a partial mapping from self.contracts to the
+                (presumably observed) empirical allocation to ratchet to.
+
+        Returns:
+            the ratcheted Composition
+
+        Preconditions:
+            self.symbol == target.contracts
+            empirical_alloc.keys() ⊆ self.contracts()
         """
-        value_assert(
+        precondition(
             not set(self.contracts) ^ set(target.contracts),
             "Target allocation has mismatched contracts.",
         )
 
-        for changed_sc, new_value in seen_alloc.items():
-            value_assert(
+        for changed_sc, new_value in empirical_alloc.items():
+            precondition(
                 0 <= new_value <= 1.0,
                 f"{changed_sc}: {new_value} must be in [0, 1]",
             )
-            value_assert(
+            precondition(
                 changed_sc in self.contracts,
                 f"{changed_sc} is not in contracts!",
             )
@@ -297,7 +201,7 @@ class Composition:
         # will be reallocated in a second phase
         pre_alloc = {}
         for sc in self.contracts:
-            if (new_pct := seen_alloc.get(sc)) is None:
+            if (new_pct := empirical_alloc.get(sc)) is None:
                 pre_alloc[sc] = self[sc]
             elif new_pct > self[sc] and target[sc] > self[sc]:
                 pre_alloc[sc] = min(target[sc], new_pct)
@@ -340,3 +244,94 @@ class Composition:
 
         assert np.isclose(sum(pre_alloc.values()), 1.0)
         return Composition.from_dict(pre_alloc)
+
+
+def calc_relative_misallocation(
+    equity: float,
+    price: float,
+    cur_alloc: int,
+    target_alloc: int,
+    *,
+    frac_coef: float,
+    pvf_coef: float,
+) -> float:
+
+    assert target_alloc >= 1
+
+    δ_frac = abs(1.0 - cur_alloc / target_alloc)
+    δ_pvf = price * abs(cur_alloc - target_alloc) / equity
+
+    return frac_coef * δ_frac + pvf_coef * δ_pvf
+
+
+def find_closest_positions(
+    funds: float,
+    composition: Composition,
+    prices: dict[SimpleContract, float],
+) -> dict[SimpleContract, int]:
+    """
+    Constructs the most closely-matching concrete, integral-share Portfolio
+    matching this Allocation.
+
+    It is guaranteed that portfolio.gpv <= allocation.
+
+    Using a MILP solver might be overkill for this, but we do, ever-so-rarely,
+    round the other way from the target (fractional) allocation. This lets us do
+    that correctly without guesswork. Can't be too careful with money.
+
+    :param funds: total amount of money available to spend on the portfolio.
+    :param composition: the target composition to approximate
+    :param prices: the assumed _unsafe_prices of the securities.
+    :return: a mapping from contacts to allocated share counts.
+    """
+
+    # will raise if a price is missing
+    comp_arr, price_arr = np.array(
+        [[composition[c], prices[c]] for c in composition.contracts]
+    ).T
+
+    assert np.isclose(comp_arr.sum(), 1.0)
+    assert len(composition) == len(prices)
+
+    target_alloc = funds * comp_arr / price_arr
+
+    prob = pulp.LpProblem()
+
+    alloc = lparray.create_anon(
+        "Alloc", shape=comp_arr.shape, cat=pulp.LpInteger
+    )
+
+    # to avoid zero division later
+    (alloc >= 1).constrain(prob, "PositivePositions")
+
+    cost = (alloc @ price_arr).sum()
+    (cost <= funds).constrain(prob, "DoNotExceedFunds")
+
+    # TODO bigM here should be the maximum possible value of
+    # alloc - target_alloc
+    # while 100k should be enough for reasonable uses, we can figure master_eq a
+    # proper max
+    loss = (alloc - target_alloc).abs(prob, "Loss", bigM=1_000_000).sumit()
+    prob += loss
+
+    try:
+        pulp.COIN(msg=False).solve(prob)
+    except Exception as e:
+        raise PortfolioSolverError(e)
+
+    status = prob.status
+    if status == LpStatusInfeasible:
+        raise ProgrammingError(f"Solver returned infeasible: {prob}.")
+
+    # this means the solver was interrupted -- we propagate that up
+    elif status == "Not Solved":
+        raise KeyboardInterrupt()
+
+    normed_misalloc = loss.value() / funds
+    Policy.MISALLOCATION.validate(normed_misalloc)
+
+    return {c: int(v) for c, v in zip(composition.contracts, alloc.values)}
+
+
+class PortfolioSolverError(Exception):
+    pass

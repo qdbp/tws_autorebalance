@@ -6,7 +6,7 @@ from typing import Iterator, Optional, Union
 from ibapi.order import Order
 
 from src.model import Acct
-from src.model.data import SimpleContract
+from src.model.contract import SimpleContract
 from src.security.bounds import Policy
 from src.util.format import pp_order
 
@@ -177,7 +177,7 @@ class OrderManager:
         """
         rec = self.find_record(acct, sc)
         if rec is None:
-            # dummy non-conflicting key
+            # dummy non-conflicting query
             self._records[-int(monotonic())] = OMTombstone(sc=sc, acct=acct)
         else:
             rec.touched = monotonic()
