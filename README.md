@@ -27,10 +27,10 @@ to think about. Other than that, it's free money.
 
 ## Roadmap
 
-The architecture of this codebase is garbage because I didn't bother separating
-the API logic from the rebalancing logic. For this reason this bot is impossible
-to backtest -- or test, at all, when not connected to TWS during live market
-hours.
+The architecture of this codebase is ~~garbage~~ the result of organic growth,
+because I didn't bother separating the API logic from the rebalancing logic.
+For this reason this bot is impossible to backtest -- or test, at all, when not
+connected to TWS during live market hours.
 
 While I personally find testing half-baked algorithm changes live in my main
 account exciting, I can see why it's not everyone's jam. Flying blind vis-a-vis
